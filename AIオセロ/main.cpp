@@ -420,9 +420,9 @@ LRESULT CALLBACK ProgressWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static HWND hProgress, hStatus;
     switch (msg) {
         case WM_CREATE:
-            hStatus = CreateWindow("STATIC", "©“®ŠwK’†...", WS_CHILD | WS_VISIBLE, 20, 15, 300, 20, hwnd, NULL, NULL, NULL);
+            hStatus = CreateWindow("STATIC", "è‡ªå‹•å­¦ç¿’ä¸­...", WS_CHILD | WS_VISIBLE, 20, 15, 300, 20, hwnd, NULL, NULL, NULL);
             hProgress = CreateWindow(PROGRESS_CLASS, NULL, WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 20, 40, 300, 25, hwnd, NULL, NULL, NULL);
-            CreateWindow("BUTTON", "ƒLƒƒƒ“ƒZƒ‹", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 130, 80, 100, 30, hwnd, (HMENU)IDCANCEL, NULL, NULL);
+            CreateWindow("BUTTON", "ã‚­ãƒ£ãƒ³ã‚»ãƒ«", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 130, 80, 100, 30, hwnd, (HMENU)IDCANCEL, NULL, NULL);
             
             SendMessage(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, g_totalGames));
             SendMessage(hProgress, PBM_SETSTEP, 1, 0);
@@ -430,7 +430,7 @@ LRESULT CALLBACK ProgressWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_USER + 100: { 
             int cur = (int)wp;
             char buf[128];
-            sprintf(buf, "‚‘¬©“®ŠwK’†... ( %d / %d ‡Š®—¹ )", cur, g_totalGames);
+            sprintf(buf, "é«˜é€Ÿè‡ªå‹•å­¦ç¿’ä¸­... ( %d / %d è©¦åˆå®Œäº† )", cur, g_totalGames);
             SetWindowText(hStatus, buf);
             SendMessage(hProgress, PBM_SETPOS, cur, 0);
             break;
@@ -463,7 +463,7 @@ void runFastLearning(HWND hwnd) {
     wcl.lpszClassName = "ProgressBoxWindow";
     RegisterClassEx(&wcl);
 
-    HWND hwndProg = CreateWindowEx(WS_EX_DLGMODALFRAME, "ProgressBoxWindow", "ŠwKƒvƒƒOƒŒƒX", 
+    HWND hwndProg = CreateWindowEx(WS_EX_DLGMODALFRAME, "ProgressBoxWindow", "å­¦ç¿’ãƒ—ãƒ­ã‚°ãƒ¬ã‚¹", 
                                    WS_POPUPWINDOW | WS_CAPTION, CW_USEDEFAULT, CW_USEDEFAULT, 350, 160, 
                                    hwnd, NULL, hInst, NULL);
     
@@ -516,7 +516,7 @@ void runFastLearning(HWND hwnd) {
         g_isPassing = false;
         
         InvalidateRect(hwnd, NULL, TRUE);
-        MessageBox(hwnd, "ŠwK‚ª“r’†‚Å’â~‚³‚ê‚Ü‚µ‚½B\n’†’f‚µ‚½‡ƒf[ƒ^‚ÍˆÀ‘S‚Éíœ‚³‚ê‚Ü‚µ‚½B", "’†’f", MB_OK | MB_ICONEXCLAMATION);
+        MessageBox(hwnd, "å­¦ç¿’ãŒé€”ä¸­ã§åœæ­¢ã•ã‚Œã¾ã—ãŸã€‚\nä¸­æ–­ã—ãŸè©¦åˆãƒ‡ãƒ¼ã‚¿ã¯å®‰å…¨ã«å‰Šé™¤ã•ã‚Œã¾ã—ãŸã€‚", "ä¸­æ–­", MB_OK | MB_ICONEXCLAMATION);
         return;
     }
 
@@ -529,7 +529,7 @@ void runFastLearning(HWND hwnd) {
     g_isPassing = false;
     
     InvalidateRect(hwnd, NULL, TRUE);
-    MessageBox(hwnd, "‚·‚×‚Ä‚Ì©“®‚‘¬ŠwK‘Îí‚ªŠ®—¹‚µ‚Ü‚µ‚½I\nŠwKŒ‹‰Ê‚ğAI‚É”½‰f‚µ‚Ü‚µ‚½B", "Š®—¹", MB_OK | MB_ICONINFORMATION);
+    MessageBox(hwnd, "ã™ã¹ã¦ã®è‡ªå‹•é«˜é€Ÿå­¦ç¿’å¯¾æˆ¦ãŒå®Œäº†ã—ã¾ã—ãŸï¼\nå­¦ç¿’çµæœã‚’AIã«åæ˜ ã—ã¾ã—ãŸã€‚", "å®Œäº†", MB_OK | MB_ICONINFORMATION);
 }
 
 void triggerAIMove(HWND hwnd) {
@@ -583,7 +583,7 @@ void triggerAIMove(HWND hwnd) {
 }
 
 int ShowLevelSelectBox(HWND hwndParent) {
-    int res = MessageBox(hwndParent, "AI‚Ì‰ŠúƒŒƒxƒ‹‚ğÅ‚iLV 10j‚É‚µ‚Ü‚·‚©H\n\ny‚Í‚¢z: ƒŒƒxƒ‹ 10 (Å‹­ƒ‚[ƒh)\ny‚¢‚¢‚¦z: ƒŒƒxƒ‹ 5 (ƒoƒ‰ƒ“ƒXƒ‚[ƒh)\nyƒLƒƒƒ“ƒZƒ‹z: ƒŒƒxƒ‹ 1 (ƒ‰ƒ“ƒ_ƒ€)", "AIƒŒƒxƒ‹‚Ì‰Šúİ’è", MB_YESNOCANCEL | MB_ICONQUESTION);
+    int res = MessageBox(hwndParent, "AIã®åˆæœŸãƒ¬ãƒ™ãƒ«ã‚’æœ€é«˜ï¼ˆLV 10ï¼‰ã«ã—ã¾ã™ã‹ï¼Ÿ\n\nã€ã¯ã„ã€‘: ãƒ¬ãƒ™ãƒ« 10 (æœ€å¼·ãƒ¢ãƒ¼ãƒ‰)\nã€ã„ã„ãˆã€‘: ãƒ¬ãƒ™ãƒ« 5 (ãƒãƒ©ãƒ³ã‚¹ãƒ¢ãƒ¼ãƒ‰)\nã€ã‚­ãƒ£ãƒ³ã‚»ãƒ«ã€‘: ãƒ¬ãƒ™ãƒ« 1 (ãƒ©ãƒ³ãƒ€ãƒ )", "AIãƒ¬ãƒ™ãƒ«ã®åˆæœŸè¨­å®š", MB_YESNOCANCEL | MB_ICONQUESTION);
     if (res == IDYES) return 10;
     if (res == IDNO) return 5;
     return 1;
@@ -593,11 +593,11 @@ LRESULT CALLBACK InputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static HWND hEdit, hBtn;
     switch (msg) {
         case WM_CREATE:
-            CreateWindow("STATIC", "©“®ŠwK‚ğs‚¤‡”‚ğ“ü—Í‚µ‚Ä‚­‚¾‚³‚¢i”¼Šp”šj:", 
+            CreateWindow("STATIC", "è‡ªå‹•å­¦ç¿’ã‚’è¡Œã†è©¦åˆæ•°ã‚’å…¥åŠ›ã—ã¦ãã ã•ã„ï¼ˆåŠè§’æ•°å­—ï¼‰:", 
                          WS_CHILD | WS_VISIBLE, 15, 15, 320, 20, hwnd, NULL, NULL, NULL);
             hEdit = CreateWindow("EDIT", g_inputBuffer, 
                                  WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 15, 45, 120, 24, hwnd, NULL, NULL, NULL);
-            hBtn = CreateWindow("BUTTON", "Šm’è", 
+            hBtn = CreateWindow("BUTTON", "ç¢ºå®š", 
                                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 150, 44, 80, 26, hwnd, (HMENU)IDOK, NULL, NULL);
             SetFocus(hEdit);
             break;
@@ -631,7 +631,7 @@ int ShowInputBox(HWND hwndParent) {
     wcl.lpszClassName = "InputBoxWindow";
     RegisterClassEx(&wcl);
 
-    HWND hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "InputBoxWindow", "©“®ŠwK”‚Ìw’è", 
+    HWND hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "InputBoxWindow", "è‡ªå‹•å­¦ç¿’æ•°ã®æŒ‡å®š", 
                                   WS_POPUPWINDOW | WS_CAPTION, CW_USEDEFAULT, CW_USEDEFAULT, 360, 130, 
                                   hwndParent, NULL, hInst, NULL);
     
@@ -881,32 +881,32 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     int lineHeight = 32;
 
     SetTextColor(memDC, RGB(0, 0, 0));
-    sprintf(buf, "AIƒIƒZƒ %s", (g_mode == 0 ? "(PVP)" : (g_mode == 1 ? "(PVE)" : "(EVE)")));
+    sprintf(buf, "AIã‚ªã‚»ãƒ­ %s", (g_mode == 0 ? "(PVP)" : (g_mode == 1 ? "(PVE)" : "(EVE)")));
     TextOut(memDC, infoX, infoY, buf, (int)strlen(buf));
 
-    TextOut(memDC, infoX, infoY + lineHeight * 1, "\\\\\\\\\\\\\\\\\\\\", 24);
+    TextOut(memDC, infoX, infoY + lineHeight * 1, "â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•â€•", 24);
 
-    sprintf(buf, "•: %d", blackCount);
+    sprintf(buf, "é»’: %d", blackCount);
     TextOut(memDC, infoX, infoY + lineHeight * 2, buf, (int)strlen(buf));
-    sprintf(buf, "”’: %d", whiteCount);
+    sprintf(buf, "ç™½: %d", whiteCount);
     TextOut(memDC, infoX, infoY + lineHeight * 3, buf, (int)strlen(buf));
 
     int blackProb = 50, whiteProb = 50;
     estimateWinProbabilities(blackProb, whiteProb);
-    sprintf(buf, "Ÿ—¦—\‘ª: • %d%% / ”’ %d%%", blackProb, whiteProb);
+    sprintf(buf, "å‹ç‡äºˆæ¸¬: é»’ %d%% / ç™½ %d%%", blackProb, whiteProb);
     TextOut(memDC, infoX, infoY + lineHeight * 4, buf, (int)strlen(buf));
 
-    sprintf(buf, "AIƒŒƒxƒ‹: %d / 10", g_aiLevel);
+    sprintf(buf, "AIãƒ¬ãƒ™ãƒ«: %d / 10", g_aiLevel);
     TextOut(memDC, infoX, infoY + lineHeight * 5, buf, (int)strlen(buf));
 
-    sprintf(buf, "—İŒvŠwKè”: %d", g_totalDataCount);
+    sprintf(buf, "ç´¯è¨ˆå­¦ç¿’æ‰‹æ•°: %d", g_totalDataCount);
     TextOut(memDC, infoX, infoY + lineHeight * 6, buf, (int)strlen(buf));
 
     RECT buttonRects[3];
     buttonRects[0] = BTN_RECT_PVP;
     buttonRects[1] = BTN_RECT_PVE;
     buttonRects[2] = BTN_RECT_EVE;
-    const char* buttonLabels[3] = { "l‘Îl", "l‘ÎAI", "AI‘ÎAI" };
+    const char* buttonLabels[3] = { "äººå¯¾äºº", "äººå¯¾AI", "AIå¯¾AI" };
 
     for (int i = 0; i < 3; i++) {
         HBRUSH hBtnBrush = CreateSolidBrush((g_mode == i ? RGB(60, 130, 220) : RGB(220, 220, 220)));
@@ -926,17 +926,17 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     }
 
     SetTextColor(memDC, RGB(120, 120, 120));
-    sprintf(buf, "[1]-[0]: AI‹­“x•ÏX");
+    sprintf(buf, "[1]-[0]: AIå¼·åº¦å¤‰æ›´");
     TextOut(memDC, infoX, winH - 140, buf, (int)strlen(buf));
-    sprintf(buf, "[R]: ƒŠƒZƒbƒg (ŠwKŒp‘±)");
+    sprintf(buf, "[R]: ãƒªã‚»ãƒƒãƒˆ (å­¦ç¿’ç¶™ç¶š)");
     TextOut(memDC, infoX, winH - 112, buf, (int)strlen(buf));
-    sprintf(buf, "[S]: ƒTƒ|[ƒg ON/OFF");
+    sprintf(buf, "[S]: ã‚µãƒãƒ¼ãƒˆ ON/OFF");
     TextOut(memDC, infoX, winH - 84, buf, (int)strlen(buf));
-    sprintf(buf, "[T]: ƒTƒ|[ƒg‘ÎÛØ‘Ö");
+    sprintf(buf, "[T]: ã‚µãƒãƒ¼ãƒˆå¯¾è±¡åˆ‡æ›¿");
     TextOut(memDC, infoX, winH - 56, buf, (int)strlen(buf));
-    sprintf(buf, "¶ƒNƒŠƒbƒN‚ÅÎ‚ğ”z’u‚µ‚Ü‚·");
+    sprintf(buf, "å·¦ã‚¯ãƒªãƒƒã‚¯ã§çŸ³ã‚’é…ç½®ã—ã¾ã™");
     TextOut(memDC, infoX, winH - 28, buf, (int)strlen(buf));
-    sprintf(buf, "ƒTƒ|[ƒg: %s %s", (g_supportMode ? "ON" : "OFF"), (g_supportTarget == BLACK ? "•" : "”’"));
+    sprintf(buf, "ã‚µãƒãƒ¼ãƒˆ: %s %s", (g_supportMode ? "ON" : "OFF"), (g_supportTarget == BLACK ? "é»’" : "ç™½"));
     TextOut(memDC, infoX, winH - 168, buf, (int)strlen(buf));
 
     BitBlt(hdc, 0, 0, winW, winH, memDC, 0, 0, SRCCOPY);
@@ -952,7 +952,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             trainAIFromDataset(); 
             g_aiLevel = ShowLevelSelectBox(hwnd);
 
-            if (MessageBox(hwnd, "— ‚ÅˆêŠ‡‚µ‚ÄuAI vs AI ©“®‚‘¬ŠwKv‚ğÀs‚µ‚Ü‚·‚©H", "‚‘¬ŠwK‚ÌŠm”F", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (MessageBox(hwnd, "è£ã§ä¸€æ‹¬ã—ã¦ã€ŒAI vs AI è‡ªå‹•é«˜é€Ÿå­¦ç¿’ã€ã‚’å®Ÿè¡Œã—ã¾ã™ã‹ï¼Ÿ", "é«˜é€Ÿå­¦ç¿’ã®ç¢ºèª", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 g_totalGames = ShowInputBox(hwnd); 
                 runFastLearning(hwnd);
             }
@@ -1088,7 +1088,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, hInst, NULL, LoadCursor(NULL, IDC_ARROW), NULL, NULL, "OthelloAI_v5", NULL };
     RegisterClassEx(&wc);
-    HWND hwnd = CreateWindow("OthelloAI_v5", "ƒ}ƒ‹ƒ`ƒ‚[ƒh‘Î‰E‚‘¬ŠwKƒIƒZƒƒVƒXƒeƒ€", WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 760, 440, NULL, NULL, hInst, NULL);
+    HWND hwnd = CreateWindow("OthelloAI_v5", "ãƒãƒ«ãƒãƒ¢ãƒ¼ãƒ‰å¯¾å¿œãƒ»é«˜é€Ÿå­¦ç¿’ã‚ªã‚»ãƒ­ã‚·ã‚¹ãƒ†ãƒ ", WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 760, 440, NULL, NULL, hInst, NULL);
     ShowWindow(hwnd, nShow); UpdateWindow(hwnd);
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
