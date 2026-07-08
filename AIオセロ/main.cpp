@@ -152,36 +152,228 @@ void truncateUnfinishedGame();
 vector<FlipAnimation> getFlipAnimationsForMove(int r, int c, int player);
 FlipAnimation* findFlipAnimation(int r, int c);
 
-Move selectAIMoveBasedOnLevel(const vector<Move>& moves) {
-    int rate = (g_aiLevel - 1) * 11;
-    if ((rand() % 100) < rate) {
-        int bestIdx = 0;
-        double maxWeight = -999999.0;
-        for (size_t i = 0; i < moves.size(); i++) {
-            int r = moves[i].r;
-            int c = moves[i].c;
-            double w = g_weightTable[r][c];
+// --- 最強AIのための評価関数とアルファベータ探索ルーチン ---
 
-            if ((r == 1 && c == 1 && g_game.board[0][0] == EMPTY) ||
-                (r == 1 && c == 6 && g_game.board[0][7] == EMPTY) ||
-                (r == 6 && c == 1 && g_game.board[7][0] == EMPTY) ||
-                (r == 6 && c == 6 && g_game.board[7][7] == EMPTY)) {
-                w -= 45.0;
+// 固定の位置評価テーブル（静的譜面パターン評価のベース）
+const int STATIC_WEIGHT[8][8] = {
+    { 100, -40,  20,   5,   5,  20, -40, 100},
+    {-40, -70,  -5,  -5,  -5,  -5, -70, -40},
+    {  20,  -5,  15,   3,   3,  15,  -5,  20},
+    {   5,  -5,   3,   3,   3,   3,  -5,   5},
+    {   5,  -5,   3,   3,   3,   3,  -5,   5},
+    {  20,  -5,  15,   3,   3,  15,  -5,  20},
+    {-40, -70,  -5,  -5,  -5,  -5, -70, -40},
+    { 100, -40,  20,   5,   5,  20, -40, 100}
+};
+
+// 盤面全体の評価関数 (譜面パターン＋着手可能数＋確定石)
+int evaluateBoard(const Othello& state, int aiPlayer) {
+    int myScore = 0;
+    int oppScore = 0;
+    int emptyCount = 0;
+    int myStones = 0;
+    int oppStones = 0;
+
+    // 1. 石数と位置評価、データセットから学習した重みの加算
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            if (state.board[i][j] == EMPTY) {
+                emptyCount++;
+                continue;
             }
-            if (r == 0 || r == 7 || c == 0 || c == 7) {
-                w += 15.0; 
+            
+            // 基本位置評価 + 自己学習データセットの重みを反映
+            int w = STATIC_WEIGHT[i][j] + (int)(g_weightTable[i][j] * 0.1);
+            
+            // 角の隣(X打ち・C打ち)の動的評価（角が取られているなら悪手ではない）
+            if ((i == 1 && j == 1 && state.board[0][0] != EMPTY) ||
+                (i == 1 && j == 6 && state.board[0][7] != EMPTY) ||
+                (i == 6 && j == 1 && state.board[7][0] != EMPTY) ||
+                (i == 6 && j == 6 && state.board[7][7] != EMPTY)) {
+                w += 50; 
             }
 
-            if (w > maxWeight) {
-                maxWeight = w;
-                bestIdx = i;
+            if (state.board[i][j] == aiPlayer) {
+                myScore += w;
+                myStones++;
+            } else {
+                oppScore += w;
+                oppStones++;
             }
         }
-        return moves[bestIdx];
+    }
+
+    // 終盤（空きマス16以下）なら純粋な石数の多さを最優先（完全勝利モード）
+    if (emptyCount <= 16) {
+        return (myStones - oppStones) * 10000;
+    }
+
+    // 2. 着手可能数（モビリティ評価：相手の行動を制限する）
+    Othello tempState = state;
+    tempState.turn = aiPlayer;
+    int myMoves = (int)tempState.getValidMoves().size();
+    tempState.turn = -aiPlayer;
+    int oppMoves = (int)tempState.getValidMoves().size();
+
+    // 3. 序盤・中盤の戦略的ペナルティ（石を多く取りすぎないようにする）
+    int stoneCountPenalty = 0;
+    if (emptyCount > 30) { // 序盤は石を少なく保つ方が強い
+        stoneCountPenalty = -(myStones * 15);
+    }
+
+    // 複合評価を合算して返す
+    return (myScore - oppScore) + (myMoves - oppMoves) * 25 + stoneCountPenalty;
+}
+
+// 高速化のための着手ソート用構造体
+struct RatedMove {
+    Move m;
+    int rate;
+};
+
+// アルファベータ探索本体 (時間制限なし全探索対応)
+int alphaBetaSearch(Othello& state, int depth, int alpha, int beta, int aiPlayer, bool isMax) {
+    if (depth == 0) {
+        return evaluateBoard(state, aiPlayer);
+    }
+
+    vector<Move> moves = state.getValidMoves();
+    if (moves.empty()) {
+        // パスの場合、相手に手番を回して深く読む
+        Othello nextState = state;
+        nextState.turn = -nextState.turn;
+        vector<Move> oppMoves = nextState.getValidMoves();
+        if (oppMoves.empty()) {
+            // 両者パス（ゲーム終了）なら石数判定
+            int myCount = 0, oppCount = 0;
+            for (int i = 0; i < BOARD_SIZE; i++) {
+                for (int j = 0; j < BOARD_SIZE; j++) {
+                    if (state.board[i][j] == aiPlayer) myCount++;
+                    else if (state.board[i][j] == -aiPlayer) oppCount++;
+                }
+            }
+            if (myCount > oppCount) return 1000000 + (myCount - oppCount);
+            if (myCount < oppCount) return -1000000 - (oppCount - myCount);
+            return 0;
+        }
+        return alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, !isMax);
+    }
+
+    // Move Ordering（評価の高い手を先に探索して刈り込み効率をアップ）
+    vector<RatedMove> ratedMoves;
+    for (size_t i = 0; i < moves.size(); i++) {
+        RatedMove rm;
+        rm.m = moves[i];
+        rm.rate = STATIC_WEIGHT[moves[i].r][moves[i].c];
+        ratedMoves.push_back(rm);
+    }
+    // 単純なバブルソート (BCC32対応)
+    for (size_t i = 0; i < ratedMoves.size(); i++) {
+        for (size_t j = i + 1; j < ratedMoves.size(); j++) {
+            if ((isMax && ratedMoves[i].rate < ratedMoves[j].rate) || (!isMax && ratedMoves[i].rate > ratedMoves[j].rate)) {
+                RatedMove tmp = ratedMoves[i];
+                ratedMoves[i] = ratedMoves[j];
+                ratedMoves[j] = tmp;
+            }
+        }
+    }
+
+    if (isMax) {
+        int maxEval = -9999999;
+        for (size_t i = 0; i < ratedMoves.size(); i++) {
+            Othello nextState = state;
+            nextState.isValidMove(ratedMoves[i].m.r, ratedMoves[i].m.c, true);
+            nextState.turn = -nextState.turn;
+            
+            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, false);
+            if (eval > maxEval) maxEval = eval;
+            if (eval > alpha) alpha = eval;
+            if (beta <= alpha) break; // βカット
+        }
+        return maxEval;
     } else {
-        return moves[rand() % moves.size()];
+        int minEval = 9999999;
+        for (size_t i = 0; i < ratedMoves.size(); i++) {
+            Othello nextState = state;
+            nextState.isValidMove(ratedMoves[i].m.r, ratedMoves[i].m.c, true);
+            nextState.turn = -nextState.turn;
+
+            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, true);
+            if (eval < minEval) minEval = eval;
+            if (eval < beta) beta = eval;
+            if (beta <= alpha) break; // αカット
+        }
+        return minEval;
     }
 }
+
+// 既存のAI思考処理を「最強アルファベータ探索」に完全リプレイス
+Move selectAIMoveBasedOnLevel(const vector<Move>& moves) {
+    if (moves.empty()) {
+        Move m = {0, 0}; return m;
+    }
+
+    // レベル1?4は既存互換の確率的ランダム要素
+    int rate = (g_aiLevel - 1) * 11;
+    if (g_aiLevel < 5 && (rand() % 100) >= rate) {
+        return moves[rand() % moves.size()];
+    }
+
+    // レベルに応じた探索深さの設定 (レベル10＝最強モード・時間無制限)
+    int maxDepth = 1;
+    if (g_aiLevel == 5) maxDepth = 3;
+    else if (g_aiLevel == 6) maxDepth = 4;
+    else if (g_aiLevel == 7) maxDepth = 5;
+    else if (g_aiLevel == 8) maxDepth = 6;
+    else if (g_aiLevel == 9) maxDepth = 8;
+    else if (g_aiLevel >= 10) maxDepth = 10; // 10手先読み
+
+    // 空きマスのカウント
+    int emptyCount = 0;
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            if (g_game.board[i][j] == EMPTY) emptyCount++;
+        }
+    }
+
+    // 【終盤完全読み】空きマスが16以下なら、残り全てのマスを完全に読み切る
+    if (g_aiLevel >= 10 && emptyCount <= 16) {
+        maxDepth = emptyCount;
+    }
+
+    int aiPlayer = g_game.turn;
+    int bestScore = -99999999;
+    size_t bestIdx = 0;
+
+    // 最善手をαβ探索
+    for (size_t i = 0; i < moves.size(); i++) {
+        Othello nextState = g_game;
+        nextState.isValidMove(moves[i].r, moves[i].c, true);
+        nextState.turn = -nextState.turn;
+
+        // 時間制限なしで深さの限界までαβ探索を実行
+        int score = alphaBetaSearch(nextState, maxDepth - 1, -99999999, 99999999, aiPlayer, false);
+
+        // 特定の危険なパターン（角の隣など）への追加補正（安全策）
+        int r = moves[i].r;
+        int c = moves[i].c;
+        if ((r == 1 && c == 1 && g_game.board[0][0] == EMPTY) ||
+            (r == 1 && c == 6 && g_game.board[0][7] == EMPTY) ||
+            (r == 6 && c == 1 && g_game.board[7][0] == EMPTY) ||
+            (r == 6 && c == 6 && g_game.board[7][7] == EMPTY)) {
+            score -= 50000;
+        }
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestIdx = i;
+        }
+    }
+
+    return moves[bestIdx];
+}
+
+// --- 以降、UIやデータセット処理などの既存ロジック（改変・削除なし） ---
 
 void convertOldLogsToBinary() {
     WIN32_FIND_DATA findData;
@@ -930,7 +1122,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     SetBkMode(memDC, OPAQUE);
     SetTextColor(memDC, RGB(120, 120, 120));
     
-    // winH に対する相対座標にすることで、リサイズ時に画面下端に自動追従させます
     sprintf(buf, "[1]-[0]: AI強度変更          ");
     TextOut(memDC, infoX, winH - 196, buf, (int)strlen(buf));
     sprintf(buf, "[R]: リセット (学習継続)     ");
@@ -964,7 +1155,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case WM_SIZE:
-            // ウィンドウサイズが変更されたら画面全体を再描画要求
             InvalidateRect(hwnd, NULL, FALSE);
             break;
 
@@ -1097,7 +1287,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, hInst, NULL, LoadCursor(NULL, IDC_ARROW), NULL, NULL, "OthelloAI_v5", NULL };
     RegisterClassEx(&wc);
     
-    // ウィンドウサイズをユーザーが自由に変更できるように制限（& ~WS_THICKFRAME & ~WS_MAXIMIZEBOX）を除去
     HWND hwnd = CreateWindow("OthelloAI_v5", "マルチモード対応・高速学習オセロシステム", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 760, 440, NULL, NULL, hInst, NULL);
     ShowWindow(hwnd, nShow); UpdateWindow(hwnd);
     MSG msg;
