@@ -14,7 +14,7 @@ using namespace std;
 typedef BOOL (WINAPI *INITCOMMONCONTROLSEXPROC)(const INITCOMMONCONTROLSEX*);
 
 const int BOARD_SIZE = 8;
-const int CELL_SIZE = 50;
+int g_cellSize = 50; // ウィンドウサイズに応じて動的に変化
 const int EMPTY = 0;
 const int BLACK = 1;
 const int WHITE = -1;
@@ -119,9 +119,10 @@ bool g_inputDone = false;
 
 const unsigned char MOVE_PASS = 0xFF;
 
-const RECT BTN_RECT_PVP = { 430, 170, 520, 200 };
-const RECT BTN_RECT_PVE = { 530, 170, 620, 200 };
-const RECT BTN_RECT_EVE = { 630, 170, 720, 200 };
+// ボタン位置（WndProc内、DrawBoard内でリサイズに合わせて動的に計算）
+RECT g_btnRectPvP;
+RECT g_btnRectPvE;
+RECT g_btnRectEvE;
 
 bool g_learningCancelled = false;
 streampos g_gameStartPosition = 0; 
@@ -141,6 +142,10 @@ int g_animationStep = 0;
 const int ANIMATION_STEPS = 3; 
 vector<FlipAnimation> g_flipAnimations;
 
+// AI思考の進捗表示用グローバル変数
+HWND g_hThinkingProgress = NULL;
+bool g_isThinking = false;
+
 void convertOldLogsToBinary();
 void trainAIFromDataset();
 void saveStepToDataset(Move nextMove, bool isPass);
@@ -152,45 +157,34 @@ void truncateUnfinishedGame();
 vector<FlipAnimation> getFlipAnimationsForMove(int r, int c, int player);
 FlipAnimation* findFlipAnimation(int r, int c);
 
-// --- 最強AIのための評価関数とアルファベータ探索ルーチン ---
-
-// 固定の位置評価テーブル（静的譜面パターン評価のベース）
 const int STATIC_WEIGHT[8][8] = {
-    { 100, -40,  20,   5,   5,  20, -40, 100},
+    { 120, -40,  20,   5,   5,  20, -40, 120},
     {-40, -70,  -5,  -5,  -5,  -5, -70, -40},
     {  20,  -5,  15,   3,   3,  15,  -5,  20},
     {   5,  -5,   3,   3,   3,   3,  -5,   5},
     {   5,  -5,   3,   3,   3,   3,  -5,   5},
     {  20,  -5,  15,   3,   3,  15,  -5,  20},
     {-40, -70,  -5,  -5,  -5,  -5, -70, -40},
-    { 100, -40,  20,   5,   5,  20, -40, 100}
+    { 120, -40,  20,   5,   5,  20, -40, 120}
 };
 
-// 盤面全体の評価関数 (譜面パターン＋着手可能数＋確定石)
-int evaluateBoard(const Othello& state, int aiPlayer) {
+int evaluateBoard(const Othello& state, int aiPlayer, int emptyCount) {
     int myScore = 0;
     int oppScore = 0;
-    int emptyCount = 0;
     int myStones = 0;
     int oppStones = 0;
 
-    // 1. 石数と位置評価、データセットから学習した重みの加算
     for (int i = 0; i < BOARD_SIZE; i++) {
         for (int j = 0; j < BOARD_SIZE; j++) {
-            if (state.board[i][j] == EMPTY) {
-                emptyCount++;
-                continue;
-            }
+            if (state.board[i][j] == EMPTY) continue;
             
-            // 基本位置評価 + 自己学習データセットの重みを反映
-            int w = STATIC_WEIGHT[i][j] + (int)(g_weightTable[i][j] * 0.1);
+            int w = STATIC_WEIGHT[i][j] + (int)(g_weightTable[i][j] * 0.05);
             
-            // 角の隣(X打ち・C打ち)の動的評価（角が取られているなら悪手ではない）
             if ((i == 1 && j == 1 && state.board[0][0] != EMPTY) ||
                 (i == 1 && j == 6 && state.board[0][7] != EMPTY) ||
                 (i == 6 && j == 1 && state.board[7][0] != EMPTY) ||
                 (i == 6 && j == 6 && state.board[7][7] != EMPTY)) {
-                w += 50; 
+                w += 60; 
             }
 
             if (state.board[i][j] == aiPlayer) {
@@ -203,48 +197,40 @@ int evaluateBoard(const Othello& state, int aiPlayer) {
         }
     }
 
-    // 終盤（空きマス16以下）なら純粋な石数の多さを最優先（完全勝利モード）
-    if (emptyCount <= 16) {
+    if (emptyCount <= 12) {
         return (myStones - oppStones) * 10000;
     }
 
-    // 2. 着手可能数（モビリティ評価：相手の行動を制限する）
     Othello tempState = state;
     tempState.turn = aiPlayer;
     int myMoves = (int)tempState.getValidMoves().size();
     tempState.turn = -aiPlayer;
     int oppMoves = (int)tempState.getValidMoves().size();
 
-    // 3. 序盤・中盤の戦略的ペナルティ（石を多く取りすぎないようにする）
     int stoneCountPenalty = 0;
-    if (emptyCount > 30) { // 序盤は石を少なく保つ方が強い
-        stoneCountPenalty = -(myStones * 15);
+    if (emptyCount > 28) { 
+        stoneCountPenalty = -(myStones * 12);
     }
 
-    // 複合評価を合算して返す
-    return (myScore - oppScore) + (myMoves - oppMoves) * 25 + stoneCountPenalty;
+    return (myScore - oppScore) + (myMoves - oppMoves) * 30 + stoneCountPenalty;
 }
 
-// 高速化のための着手ソート用構造体
 struct RatedMove {
     Move m;
     int rate;
 };
 
-// アルファベータ探索本体 (時間制限なし全探索対応)
-int alphaBetaSearch(Othello& state, int depth, int alpha, int beta, int aiPlayer, bool isMax) {
+int alphaBetaSearch(Othello& state, int depth, int alpha, int beta, int aiPlayer, bool isMax, int emptyCount) {
     if (depth == 0) {
-        return evaluateBoard(state, aiPlayer);
+        return evaluateBoard(state, aiPlayer, emptyCount);
     }
 
     vector<Move> moves = state.getValidMoves();
     if (moves.empty()) {
-        // パスの場合、相手に手番を回して深く読む
         Othello nextState = state;
         nextState.turn = -nextState.turn;
         vector<Move> oppMoves = nextState.getValidMoves();
         if (oppMoves.empty()) {
-            // 両者パス（ゲーム終了）なら石数判定
             int myCount = 0, oppCount = 0;
             for (int i = 0; i < BOARD_SIZE; i++) {
                 for (int j = 0; j < BOARD_SIZE; j++) {
@@ -256,18 +242,21 @@ int alphaBetaSearch(Othello& state, int depth, int alpha, int beta, int aiPlayer
             if (myCount < oppCount) return -1000000 - (oppCount - myCount);
             return 0;
         }
-        return alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, !isMax);
+        return alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, !isMax, emptyCount);
     }
 
-    // Move Ordering（評価の高い手を先に探索して刈り込み効率をアップ）
     vector<RatedMove> ratedMoves;
     for (size_t i = 0; i < moves.size(); i++) {
         RatedMove rm;
         rm.m = moves[i];
         rm.rate = STATIC_WEIGHT[moves[i].r][moves[i].c];
+        if ((moves[i].r == 1 && moves[i].c == 1) || (moves[i].r == 1 && moves[i].c == 6) ||
+            (moves[i].r == 6 && moves[i].c == 1) || (moves[i].r == 6 && moves[i].c == 6)) {
+            rm.rate -= 50;
+        }
         ratedMoves.push_back(rm);
     }
-    // 単純なバブルソート (BCC32対応)
+
     for (size_t i = 0; i < ratedMoves.size(); i++) {
         for (size_t j = i + 1; j < ratedMoves.size(); j++) {
             if ((isMax && ratedMoves[i].rate < ratedMoves[j].rate) || (!isMax && ratedMoves[i].rate > ratedMoves[j].rate)) {
@@ -285,10 +274,10 @@ int alphaBetaSearch(Othello& state, int depth, int alpha, int beta, int aiPlayer
             nextState.isValidMove(ratedMoves[i].m.r, ratedMoves[i].m.c, true);
             nextState.turn = -nextState.turn;
             
-            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, false);
+            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, false, emptyCount - 1);
             if (eval > maxEval) maxEval = eval;
             if (eval > alpha) alpha = eval;
-            if (beta <= alpha) break; // βカット
+            if (beta <= alpha) break; 
         }
         return maxEval;
     } else {
@@ -298,37 +287,33 @@ int alphaBetaSearch(Othello& state, int depth, int alpha, int beta, int aiPlayer
             nextState.isValidMove(ratedMoves[i].m.r, ratedMoves[i].m.c, true);
             nextState.turn = -nextState.turn;
 
-            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, true);
+            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, true, emptyCount - 1);
             if (eval < minEval) minEval = eval;
             if (eval < beta) beta = eval;
-            if (beta <= alpha) break; // αカット
+            if (beta <= alpha) break; 
         }
         return minEval;
     }
 }
 
-// 既存のAI思考処理を「最強アルファベータ探索」に完全リプレイス
 Move selectAIMoveBasedOnLevel(const vector<Move>& moves) {
     if (moves.empty()) {
         Move m = {0, 0}; return m;
     }
 
-    // レベル1?4は既存互換の確率的ランダム要素
     int rate = (g_aiLevel - 1) * 11;
     if (g_aiLevel < 5 && (rand() % 100) >= rate) {
         return moves[rand() % moves.size()];
     }
 
-    // レベルに応じた探索深さの設定 (レベル10＝最強モード・時間無制限)
     int maxDepth = 1;
     if (g_aiLevel == 5) maxDepth = 3;
     else if (g_aiLevel == 6) maxDepth = 4;
     else if (g_aiLevel == 7) maxDepth = 5;
     else if (g_aiLevel == 8) maxDepth = 6;
-    else if (g_aiLevel == 9) maxDepth = 8;
-    else if (g_aiLevel >= 10) maxDepth = 10; // 10手先読み
+    else if (g_aiLevel == 9) maxDepth = 7;
+    else if (g_aiLevel >= 10) maxDepth = 8; 
 
-    // 空きマスのカウント
     int emptyCount = 0;
     for (int i = 0; i < BOARD_SIZE; i++) {
         for (int j = 0; j < BOARD_SIZE; j++) {
@@ -336,44 +321,62 @@ Move selectAIMoveBasedOnLevel(const vector<Move>& moves) {
         }
     }
 
-    // 【終盤完全読み】空きマスが16以下なら、残り全てのマスを完全に読み切る
-    if (g_aiLevel >= 10 && emptyCount <= 16) {
+    if (g_aiLevel >= 10 && emptyCount <= 12) {
         maxDepth = emptyCount;
     }
 
     int aiPlayer = g_game.turn;
-    int bestScore = -99999999;
     size_t bestIdx = 0;
 
-    // 最善手をαβ探索
-    for (size_t i = 0; i < moves.size(); i++) {
-        Othello nextState = g_game;
-        nextState.isValidMove(moves[i].r, moves[i].c, true);
-        nextState.turn = -nextState.turn;
+    g_isThinking = true;
+    if (g_hThinkingProgress) {
+        SendMessage(g_hThinkingProgress, PBM_SETRANGE, 0, MAKELPARAM(0, moves.size()));
+        SendMessage(g_hThinkingProgress, PBM_SETPOS, 0, 0);
+        ShowWindow(g_hThinkingProgress, SW_SHOW);
+    }
 
-        // 時間制限なしで深さの限界までαβ探索を実行
-        int score = alphaBetaSearch(nextState, maxDepth - 1, -99999999, 99999999, aiPlayer, false);
+    for (int currentDepth = 2; currentDepth <= maxDepth; currentDepth += 2) {
+        int bestScore = -99999999;
+        for (size_t i = 0; i < moves.size(); i++) {
+            Othello nextState = g_game;
+            nextState.isValidMove(moves[i].r, moves[i].c, true);
+            nextState.turn = -nextState.turn;
 
-        // 特定の危険なパターン（角の隣など）への追加補正（安全策）
-        int r = moves[i].r;
-        int c = moves[i].c;
-        if ((r == 1 && c == 1 && g_game.board[0][0] == EMPTY) ||
-            (r == 1 && c == 6 && g_game.board[0][7] == EMPTY) ||
-            (r == 6 && c == 1 && g_game.board[7][0] == EMPTY) ||
-            (r == 6 && c == 6 && g_game.board[7][7] == EMPTY)) {
-            score -= 50000;
-        }
+            int score = alphaBetaSearch(nextState, currentDepth - 1, -99999999, 99999999, aiPlayer, false, emptyCount - 1);
 
-        if (score > bestScore) {
-            bestScore = score;
-            bestIdx = i;
+            int r = moves[i].r;
+            int c = moves[i].c;
+            if ((r == 1 && c == 1 && g_game.board[0][0] == EMPTY) ||
+                (r == 1 && c == 6 && g_game.board[0][7] == EMPTY) ||
+                (r == 6 && c == 1 && g_game.board[7][0] == EMPTY) ||
+                (r == 6 && c == 6 && g_game.board[7][7] == EMPTY)) {
+                score -= 40000;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestIdx = i;
+            }
+
+            // 最深層のループ時に、プログレスバーの進行状況を進める
+            if (currentDepth >= maxDepth - 1 && g_hThinkingProgress) {
+                SendMessage(g_hThinkingProgress, PBM_SETPOS, i + 1, 0);
+                // Windowsメッセージを強制処理してプログレスバーの描画を反映
+                MSG msg;
+                while (PeekMessage(&msg, g_hThinkingProgress, 0, 0, PM_REMOVE)) {
+                    DispatchMessage(&msg);
+                }
+            }
         }
     }
 
+    if (g_hThinkingProgress) {
+        ShowWindow(g_hThinkingProgress, SW_HIDE);
+    }
+    g_isThinking = false;
+
     return moves[bestIdx];
 }
-
-// --- 以降、UIやデータセット処理などの既存ロジック（改変・削除なし） ---
 
 void convertOldLogsToBinary() {
     WIN32_FIND_DATA findData;
@@ -777,7 +780,7 @@ void triggerAIMove(HWND hwnd) {
 }
 
 int ShowLevelSelectBox(HWND hwndParent) {
-    int res = MessageBox(hwndParent, "AIの初期レベルを最高（LV 10）にしますか？\n\n【はい】: レベル 10 (最強モード)\n【いいえ】: レベル 5 (バランスモード)\n【キャンセル】: レベル 1 (ランダム)", "AIレベルの初期設定", MB_YESNOCANCEL | MB_ICONQUESTION);
+    int res = MessageBox(hwndParent, "AIの初期レベルを最高（LV 10）にしますか？\n\n【はい】: レベル 10 (最適化最強モード)\n【いいえ】: レベル 5 (バランスモード)\n【キャンセル】: レベル 1 (ランダム)", "AIレベルの初期設定", MB_YESNOCANCEL | MB_ICONQUESTION);
     if (res == IDYES) return 10;
     if (res == IDNO) return 5;
     return 1;
@@ -868,7 +871,7 @@ void estimateWinProbabilitiesForState(const Othello& state, int& blackPct, int& 
     int blackWins = 0;
     int whiteWins = 0;
     int draws = 0;
-    const int simulations = 150; 
+    const int simulations = 100; 
 
     for (int sim = 0; sim < simulations; sim++) {
         Othello temp = state;
@@ -929,6 +932,15 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     int winW = clientRect.right - clientRect.left;
     int winH = clientRect.bottom - clientRect.top;
 
+    // 【最優先リサイズ】オセロ盤（譜面）のサイズをウィンドウの短辺（高さか幅）を基準に動的決定
+    int boardPadding = 10;
+    int availableHeight = winH - (boardPadding * 2) - 25; // 下部に多少の余白
+    if (availableHeight < 100) availableHeight = 100;
+    
+    // 盤面が最優先で正方形になるようセルサイズを決定
+    g_cellSize = availableHeight / BOARD_SIZE;
+    int boardDisplaySize = g_cellSize * BOARD_SIZE;
+
     HDC memDC = CreateCompatibleDC(hdc);
     HBITMAP hMemBitmap = CreateCompatibleBitmap(hdc, winW, winH);
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(memDC, hMemBitmap);
@@ -937,29 +949,37 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     FillRect(memDC, &clientRect, hBgBrush);
     DeleteObject(hBgBrush);
 
-    RECT infoPanel = { BOARD_SIZE * CELL_SIZE + 12, 10, winW - 10, winH - 10 };
-    HBRUSH hPanelBrush = CreateSolidBrush(RGB(250, 250, 250));
-    FillRect(memDC, &infoPanel, hPanelBrush);
-    HPEN hPanelPen = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
-    HPEN hSavedPen = (HPEN)SelectObject(memDC, hPanelPen);
-    Rectangle(memDC, infoPanel.left, infoPanel.top, infoPanel.right, infoPanel.bottom);
-    SelectObject(memDC, hSavedPen);
-    DeleteObject(hPanelPen);
-    DeleteObject(hPanelBrush);
+    // 情報パネルを盤面の右隣に追従させる
+    RECT infoPanel = { boardDisplaySize + 20, 10, winW - 10, winH - 10 };
+    if (infoPanel.right > infoPanel.left) {
+        HBRUSH hPanelBrush = CreateSolidBrush(RGB(250, 250, 250));
+        FillRect(memDC, &infoPanel, hPanelBrush);
+        HPEN hPanelPen = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+        HPEN hSavedPen = (HPEN)SelectObject(memDC, hPanelPen);
+        Rectangle(memDC, infoPanel.left, infoPanel.top, infoPanel.right, infoPanel.bottom);
+        SelectObject(memDC, hSavedPen);
+        DeleteObject(hPanelPen);
+        DeleteObject(hPanelBrush);
+    }
 
+    // オセロ盤背景描画
     HBRUSH hBoardBrush = CreateSolidBrush(RGB(34, 139, 34));
     HBRUSH hOldBrush = (HBRUSH)SelectObject(memDC, hBoardBrush);
-    Rectangle(memDC, 0, 0, BOARD_SIZE * CELL_SIZE, BOARD_SIZE * CELL_SIZE);
+    Rectangle(memDC, boardPadding, boardPadding, boardPadding + boardDisplaySize, boardPadding + boardDisplaySize);
 
+    // 罫線描画
     HPEN hBoardPen = CreatePen(PS_SOLID, 2, RGB(20, 80, 20));
     HPEN hBoardOldPen = (HPEN)SelectObject(memDC, hBoardPen);
     for (int i = 0; i <= BOARD_SIZE; i++) {
-        MoveToEx(memDC, i * CELL_SIZE, 0, NULL); LineTo(memDC, i * CELL_SIZE, BOARD_SIZE * CELL_SIZE);
-        MoveToEx(memDC, 0, i * CELL_SIZE, NULL); LineTo(memDC, BOARD_SIZE * CELL_SIZE, i * CELL_SIZE);
+        MoveToEx(memDC, boardPadding + i * g_cellSize, boardPadding, NULL); 
+        LineTo(memDC, boardPadding + i * g_cellSize, boardPadding + boardDisplaySize);
+        MoveToEx(memDC, boardPadding, boardPadding + i * g_cellSize, NULL); 
+        LineTo(memDC, boardPadding + boardDisplaySize, boardPadding + i * g_cellSize);
     }
     SelectObject(memDC, hBoardOldPen);
     DeleteObject(hBoardPen);
 
+    // 石の描画
     HBRUSH hBlackBrush = CreateSolidBrush(RGB(0, 0, 0));
     HBRUSH hWhiteBrush = CreateSolidBrush(RGB(255, 255, 255));
     HPEN hNullPen = CreatePen(PS_NULL, 0, RGB(0, 0, 0));
@@ -999,22 +1019,28 @@ void DrawBoard(HDC hdc, HWND hwnd) {
                 continue;
             }
 
-            int pieceWidth = (int)((CELL_SIZE - 8) * widthScale);
-            int pieceHeight = (int)((CELL_SIZE - 8) * heightScale);
-            int left = j * CELL_SIZE + 4 + ((CELL_SIZE - 8) - pieceWidth) / 2;
-            int top = i * CELL_SIZE + 4 + ((CELL_SIZE - 8) - pieceHeight) / 2;
+            int margin = (g_cellSize >= 20) ? 4 : 1;
+            int pieceWidth = (int)((g_cellSize - (margin * 2)) * widthScale);
+            int pieceHeight = (int)((g_cellSize - (margin * 2)) * heightScale);
+            int left = boardPadding + j * g_cellSize + margin + ((g_cellSize - (margin * 2)) - pieceWidth) / 2;
+            int top = boardPadding + i * g_cellSize + margin + ((g_cellSize - (margin * 2)) - pieceHeight) / 2;
             int right = left + pieceWidth;
             int bottom = top + pieceHeight;
             Ellipse(memDC, left, top, right, bottom);
         }
     }
 
+    // ガイド用ドットの描画
     if (!g_gameOver && ((g_mode == 0) || (g_mode == 1 && g_game.turn == BLACK))) {
         g_gameValidMoves = g_game.getValidMoves();
         HBRUSH hGuideBrush = CreateSolidBrush(RGB(100, 220, 100));
         SelectObject(memDC, hGuideBrush);
+        int radius = g_cellSize / 3;
+        if (radius < 2) radius = 2;
         for (size_t i = 0; i < g_gameValidMoves.size(); i++) {
-            Ellipse(memDC, g_gameValidMoves[i].c * CELL_SIZE + 16, g_gameValidMoves[i].r * CELL_SIZE + 16, (g_gameValidMoves[i].c + 1) * CELL_SIZE - 16, (g_gameValidMoves[i].r + 1) * CELL_SIZE - 16);
+            int cx = boardPadding + g_gameValidMoves[i].c * g_cellSize + g_cellSize / 2;
+            int cy = boardPadding + g_gameValidMoves[i].r * g_cellSize + g_cellSize / 2;
+            Ellipse(memDC, cx - radius, cy - radius, cx + radius, cy + radius);
         }
         DeleteObject(hGuideBrush);
 
@@ -1036,7 +1062,11 @@ void DrawBoard(HDC hdc, HWND hwnd) {
                 }
             }
             if (bestMove.r >= 0) {
-                Ellipse(memDC, bestMove.c * CELL_SIZE + 10, bestMove.r * CELL_SIZE + 10, (bestMove.c + 1) * CELL_SIZE - 10, (bestMove.r + 1) * CELL_SIZE - 10);
+                int sRadius = g_cellSize / 2 - 2;
+                if (sRadius < 2) sRadius = 2;
+                int cx = boardPadding + bestMove.c * g_cellSize + g_cellSize / 2;
+                int cy = boardPadding + bestMove.r * g_cellSize + g_cellSize / 2;
+                Ellipse(memDC, cx - sRadius, cy - sRadius, cx + sRadius, cy + sRadius);
             }
             DeleteObject(hSupportBrush);
         }
@@ -1057,81 +1087,100 @@ void DrawBoard(HDC hdc, HWND hwnd) {
         }
     }
 
-    SetBkMode(memDC, OPAQUE);
-    SetBkColor(memDC, RGB(250, 250, 250));
-    char buf[256];
-
+    // 座標（A~H, 1~8）の動的描画
     SetBkMode(memDC, TRANSPARENT);
-    SetTextColor(memDC, RGB(245, 245, 245));
+    SetTextColor(memDC, RGB(60, 60, 60));
     for (int i = 0; i < BOARD_SIZE; i++) {
         char txt[2] = { (char)('A' + i), '\0' };
-        TextOut(memDC, i * CELL_SIZE + 18, BOARD_SIZE * CELL_SIZE + 6, txt, 1);
+        TextOut(memDC, boardPadding + i * g_cellSize + (g_cellSize / 2) - 4, boardPadding + boardDisplaySize + 2, txt, 1);
     }
     for (int i = 0; i < BOARD_SIZE; i++) {
         char txt[2] = { (char)('1' + i), '\0' };
-        TextOut(memDC, 6, i * CELL_SIZE + 16, txt, 1);
+        TextOut(memDC, boardPadding + boardDisplaySize + 4, boardPadding + i * g_cellSize + (g_cellSize / 2) - 6, txt, 1);
     }
 
-    SetBkMode(memDC, OPAQUE);
-    int infoX = BOARD_SIZE * CELL_SIZE + 28;
-    int infoY = 26;
-    int lineHeight = 32;
+    // 情報テキスト描画
+    if (infoPanel.right > infoPanel.left + 40) {
+        SetBkMode(memDC, OPAQUE);
+        SetBkColor(memDC, RGB(250, 250, 250));
+        char buf[256];
+        int infoX = infoPanel.left + 16;
+        int infoY = infoPanel.top + 16;
+        int lineHeight = 26;
 
-    SetTextColor(memDC, RGB(0, 0, 0));
+        SetTextColor(memDC, RGB(0, 0, 0));
+        sprintf(buf, "黒の石数: %d        ", blackCount); 
+        TextOut(memDC, infoX, infoY, buf, (int)strlen(buf));
+        sprintf(buf, "白の石数: %d        ", whiteCount);
+        TextOut(memDC, infoX, infoY + lineHeight * 1, buf, (int)strlen(buf));
 
-    sprintf(buf, "黒の石数: %d        ", blackCount); 
-    TextOut(memDC, infoX, infoY, buf, (int)strlen(buf));
-    sprintf(buf, "白の石数: %d        ", whiteCount);
-    TextOut(memDC, infoX, infoY + lineHeight * 1, buf, (int)strlen(buf));
+        int blackProb = 50, whiteProb = 50;
+        estimateWinProbabilities(blackProb, whiteProb);
+        sprintf(buf, "勝率予測: 黒 %d%% / 白 %d%%   ", blackProb, whiteProb);
+        TextOut(memDC, infoX, infoY + lineHeight * 2, buf, (int)strlen(buf));
 
-    int blackProb = 50, whiteProb = 50;
-    estimateWinProbabilities(blackProb, whiteProb);
-    sprintf(buf, "勝率予測: 黒 %d%% / 白 %d%%   ", blackProb, whiteProb);
-    TextOut(memDC, infoX, infoY + lineHeight * 2, buf, (int)strlen(buf));
+        sprintf(buf, "AIレベル: %d / 10     ", g_aiLevel);
+        TextOut(memDC, infoX, infoY + lineHeight * 3, buf, (int)strlen(buf));
 
-    sprintf(buf, "AIレベル: %d / 10     ", g_aiLevel);
-    TextOut(memDC, infoX, infoY + lineHeight * 3, buf, (int)strlen(buf));
+        sprintf(buf, "サポート: %s %s     ", (g_supportMode ? "ON " : "OFF"), (g_supportTarget == BLACK ? "黒" : "白"));
+        TextOut(memDC, infoX, infoY + lineHeight * 4, buf, (int)strlen(buf));
 
-    sprintf(buf, "サポート: %s %s     ", (g_supportMode ? "ON " : "OFF"), (g_supportTarget == BLACK ? "黒" : "白"));
-    TextOut(memDC, infoX, infoY + lineHeight * 4, buf, (int)strlen(buf));
+        // AI思考中のみテキスト表示（下に本物のプログレスバーが配置されます）
+        if (g_isThinking) {
+            SetTextColor(memDC, RGB(220, 50, 50));
+            sprintf(buf, "AI思考中... (完了度)");
+            TextOut(memDC, infoX, infoY + lineHeight * 5, buf, (int)strlen(buf));
+        } else {
+            sprintf(buf, "                               ");
+            TextOut(memDC, infoX, infoY + lineHeight * 5, buf, (int)strlen(buf));
+        }
 
-    RECT buttonRects[3];
-    buttonRects[0] = BTN_RECT_PVP;
-    buttonRects[1] = BTN_RECT_PVE;
-    buttonRects[2] = BTN_RECT_EVE;
-    const char* buttonLabels[3] = { "人対人", "人対AI", "AI対AI" };
+        // モード変更ボタンの動的配置計算
+        int btnW = 80;
+        int btnH = 26;
+        int btnY = infoY + lineHeight * 7;
+        
+        g_btnRectPvP.left = infoX; g_btnRectPvP.top = btnY; g_btnRectPvP.right = infoX + btnW; g_btnRectPvP.bottom = btnY + btnH;
+        g_btnRectPvE.left = infoX + btnW + 10; g_btnRectPvE.top = btnY; g_btnRectPvE.right = infoX + btnW * 2 + 10; g_btnRectPvE.bottom = btnY + btnH;
+        g_btnRectEvE.left = infoX + btnW * 2 + 20; g_btnRectEvE.top = btnY; g_btnRectEvE.right = infoX + btnW * 3 + 20; g_btnRectEvE.bottom = btnY + btnH;
 
-    SetBkMode(memDC, TRANSPARENT);
-    for (int i = 0; i < 3; i++) {
-        HBRUSH hBtnBrush = CreateSolidBrush((g_mode == i ? RGB(60, 130, 220) : RGB(220, 220, 220)));
-        HPEN hBtnBorder = CreatePen(PS_SOLID, 1, RGB(150, 150, 150));
-        HPEN hOldBorder = (HPEN)SelectObject(memDC, hBtnBorder);
-        HBRUSH hOldBtnBrush = (HBRUSH)SelectObject(memDC, hBtnBrush);
-        RoundRect(memDC, buttonRects[i].left, buttonRects[i].top, buttonRects[i].right, buttonRects[i].bottom, 12, 12);
-        SelectObject(memDC, hOldBtnBrush);
-        SelectObject(memDC, hOldBorder);
-        DeleteObject(hBtnBrush);
-        DeleteObject(hBtnBorder);
+        RECT buttonRects[3];
+        buttonRects[0] = g_btnRectPvP; buttonRects[1] = g_btnRectPvE; buttonRects[2] = g_btnRectEvE;
+        const char* buttonLabels[3] = { "人対人", "人対AI", "AI対AI" };
 
-        SetTextColor(memDC, (g_mode == i ? RGB(255, 255, 255) : RGB(0, 0, 0)));
-        int textX = buttonRects[i].left + 8;
-        int textY = buttonRects[i].top + 6;
-        TextOut(memDC, textX, textY, buttonLabels[i], (int)strlen(buttonLabels[i]));
+        SetBkMode(memDC, TRANSPARENT);
+        for (int i = 0; i < 3; i++) {
+            HBRUSH hBtnBrush = CreateSolidBrush((g_mode == i ? RGB(60, 130, 220) : RGB(220, 220, 220)));
+            HPEN hBtnBorder = CreatePen(PS_SOLID, 1, RGB(150, 150, 150));
+            HPEN hOldBorder = (HPEN)SelectObject(memDC, hBtnBorder);
+            HBRUSH hOldBtnBrush = (HBRUSH)SelectObject(memDC, hBtnBrush);
+            RoundRect(memDC, buttonRects[i].left, buttonRects[i].top, buttonRects[i].right, buttonRects[i].bottom, 8, 8);
+            SelectObject(memDC, hOldBtnBrush);
+            SelectObject(memDC, hOldBorder);
+            DeleteObject(hBtnBrush);
+            DeleteObject(hBtnBorder);
+
+            SetTextColor(memDC, (g_mode == i ? RGB(255, 255, 255) : RGB(0, 0, 0)));
+            TextOut(memDC, buttonRects[i].left + 14, buttonRects[i].top + 5, buttonLabels[i], (int)strlen(buttonLabels[i]));
+        }
+
+        // 操作ヘルプメッセージの動的配置
+        SetBkMode(memDC, OPAQUE);
+        SetTextColor(memDC, RGB(120, 120, 120));
+        int helpY = winH - 160;
+        if (helpY > btnY + btnH + 20) {
+            sprintf(buf, "[1]-[0]: AI強度変更          "); TextOut(memDC, infoX, helpY, buf, (int)strlen(buf));
+            sprintf(buf, "[R]: リセット (学習継続)     "); TextOut(memDC, infoX, helpY + 24, buf, (int)strlen(buf));
+            sprintf(buf, "[S]: サポート ON/OFF         "); TextOut(memDC, infoX, helpY + 48, buf, (int)strlen(buf));
+            sprintf(buf, "[T]: サポート対象切替        "); TextOut(memDC, infoX, helpY + 72, buf, (int)strlen(buf));
+            sprintf(buf, "左クリックで石を配置します  "); TextOut(memDC, infoX, helpY + 96, buf, (int)strlen(buf));
+        }
+
+        // 思考中プログレスバーの位置を情報パネルの大きさに合わせて同期調整
+        if (g_hThinkingProgress) {
+            MoveWindow(g_hThinkingProgress, infoX, infoY + lineHeight * 6, (infoPanel.right - infoX - 20 < 150) ? 150 : infoPanel.right - infoX - 20, 16, TRUE);
+        }
     }
-
-    SetBkMode(memDC, OPAQUE);
-    SetTextColor(memDC, RGB(120, 120, 120));
-    
-    sprintf(buf, "[1]-[0]: AI強度変更          ");
-    TextOut(memDC, infoX, winH - 196, buf, (int)strlen(buf));
-    sprintf(buf, "[R]: リセット (学習継続)     ");
-    TextOut(memDC, infoX, winH - 168, buf, (int)strlen(buf));
-    sprintf(buf, "[S]: サポート ON/OFF         ");
-    TextOut(memDC, infoX, winH - 140, buf, (int)strlen(buf));
-    sprintf(buf, "[T]: サポート対象切替        ");
-    TextOut(memDC, infoX, winH - 112, buf, (int)strlen(buf));
-    sprintf(buf, "左クリックで石を配置します  ");
-    TextOut(memDC, infoX, winH - 84, buf, (int)strlen(buf));
 
     BitBlt(hdc, 0, 0, winW, winH, memDC, 0, 0, SRCCOPY);
 
@@ -1145,6 +1194,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CREATE:
             trainAIFromDataset(); 
             g_aiLevel = ShowLevelSelectBox(hwnd);
+
+            // インライン思考用プログレスバーの生成（初期は非表示）
+            g_hThinkingProgress = CreateWindow(PROGRESS_CLASS, NULL, WS_CHILD | PBS_SMOOTH, 0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
 
             if (MessageBox(hwnd, "裏で一括して「AI vs AI 自動高速学習」を実行しますか？", "高速学習の確認", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 g_totalGames = ShowInputBox(hwnd); 
@@ -1201,18 +1253,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: {
             int x = LOWORD(lp); int y = HIWORD(lp);
 
-            if (x >= BTN_RECT_PVP.left && x <= BTN_RECT_PVP.right && y >= BTN_RECT_PVP.top && y <= BTN_RECT_PVP.bottom) {
+            if (x >= g_btnRectPvP.left && x <= g_btnRectPvP.right && y >= g_btnRectPvP.top && y <= g_btnRectPvP.bottom) {
                 g_mode = 0; InvalidateRect(hwnd, NULL, TRUE); break;
             }
-            if (x >= BTN_RECT_PVE.left && x <= BTN_RECT_PVE.right && y >= BTN_RECT_PVE.top && y <= BTN_RECT_PVE.bottom) {
+            if (x >= g_btnRectPvE.left && x <= g_btnRectPvE.right && y >= g_btnRectPvE.top && y <= g_btnRectPvE.bottom) {
                 g_mode = 1; InvalidateRect(hwnd, NULL, TRUE); break;
             }
-            if (x >= BTN_RECT_EVE.left && x <= BTN_RECT_EVE.right && y >= BTN_RECT_EVE.top && y <= BTN_RECT_EVE.bottom) {
+            if (x >= g_btnRectEvE.left && x <= g_btnRectEvE.right && y >= g_btnRectEvE.top && y <= g_btnRectEvE.bottom) {
                 g_mode = 2; InvalidateRect(hwnd, NULL, TRUE); break;
             }
 
             if (!g_gameOver && !g_isAnimating) {
-                int c = x / CELL_SIZE; int r = y / CELL_SIZE;
+                // 最優先リサイズ後の座標系に合わせてクリック判定
+                int boardPadding = 10;
+                int c = (x - boardPadding) / g_cellSize; 
+                int r = (y - boardPadding) / g_cellSize;
 
                 if (g_mode == 0 || (g_mode == 1 && g_game.turn == BLACK)) {
                     vector<FlipAnimation> animations = getFlipAnimationsForMove(r, c, g_game.turn);
