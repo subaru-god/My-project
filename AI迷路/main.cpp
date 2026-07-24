@@ -5,412 +5,489 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstdio>
+#include <cmath>
 
 using namespace std;
 
-// コントロールID定義
-#define IDC_COMBO_MODE 101
-#define IDC_COMBO_AI   102
-#define IDC_COMBO_MAZE 103
-#define IDC_BTN_START  104
+// ==========================================
+// コントロールID ＆ 定数定義
+// ==========================================
+const UINT IDC_COMBO_MODE  = 101;
+const UINT IDC_COMBO_AI    = 102;
+const UINT IDC_COMBO_MAZE  = 103;
+const UINT IDC_CHK_FOG     = 104;
+const UINT IDC_BTN_START   = 105;
 
-// 定数定義
-const int CELL_SIZE = 18;  // 1マスのサイズ(px)
-const int MARGIN = 20;     // 外枠余白
-const int TOP_PANEL = 100; // ヘッダーエリア高さ
+const int CELL_SIZE = 18;   // 1マスのサイズ(px)
+const int MARGIN = 20;      // 外枠余白
+const int TOP_PANEL = 100;  // ヘッダーエリア高さ
 
-const UINT_PTR TIMER_AI = 1;
-const UINT_PTR TIMER_PLAYER = 2;
-const UINT_PTR TIMER_CLOCK = 3;
+const UINT_PTR TIMER_AI        = 1;
+const UINT_PTR TIMER_PLAYER    = 2;
+const UINT_PTR TIMER_CLOCK     = 3;
 const UINT_PTR TIMER_COUNTDOWN = 4;
 
-// 1マスあたりの自動移動スピード (80ms間隔)
-const int MOVE_SPEED_DELAY = 80;
-
-// 保存用ログファイル名
+const int MOVE_SPEED_DELAY = 80; // 1マスあたりの移動速度(ms)
 const char* LOG_FILE_NAME = "player_style.hex";
 
-// 16進数保存用のコンパクト構造体 (合計24バイト)
-#pragma pack(push, 1)
-struct GameRecordBinary {
-    UINT32 totalSteps;           // 総歩数
-    UINT32 clearTimeMs;          // クリアタイム(ms)
-    UINT32 intersectionCount;    // 交差点/角での停止回数
-    UINT32 wrongTurnsCount;      // 無効な入力（壁への入力）回数
-    double totalReactionTimeMs;  // 思考時間合計(ms)
+// ==========================================
+// 構造体・列挙型定義
+// ==========================================
+enum GameMode {
+    MODE_VS_AI = 0,
+    MODE_VS_HUMAN = 1
 };
-#pragma pack(pop)
 
-// 座標構造体
 struct Point {
-    int x, y;
+    int x;
+    int y;
+
     Point(int _x = 0, int _y = 0) : x(_x), y(_y) {}
+
     bool operator==(const Point& other) const {
         return x == other.x && y == other.y;
     }
+    bool operator!=(const Point& other) const {
+        return !(*this == other);
+    }
 };
 
-enum GameMode { MODE_VS_AI = 0, MODE_VS_HUMAN = 1 };
+// 拡張バイナリログデータ (32バイト固定)
+#pragma pack(push, 1)
+struct GameRecordBinary {
+    DWORD totalSteps;
+    DWORD clearTimeMs;
+    DWORD intersectionCount;
+    DWORD wrongTurnsCount;
+    double totalReactionTimeMs;
+    double pathEfficiencyRatio; // 最短歩数 / 実際の歩数 (効率性)
 
-// グローバル変数
-int mazeW = 21;
-int mazeH = 15;
+    GameRecordBinary() 
+        : totalSteps(0), clearTimeMs(0), intersectionCount(0), wrongTurnsCount(0), 
+          totalReactionTimeMs(0.0), pathEfficiencyRatio(1.0) {}
+};
+#pragma pack(pop)
 
-vector<vector<int> > maze;
-Point p1Pos(1, 1);
-Point p2Pos(1, 1);
-Point goalPos(1, 1);
+// ==========================================
+// プレイヤーデータ＆ログ管理クラス
+// ==========================================
+class PlayerStyleTracker {
+public:
+    double avgReactionMs;
+    double errorRate;
+    double avgEfficiency; // 最短経路に対する移動効率
 
-Point aiLastPos(1, 1);
+    PlayerStyleTracker() : avgReactionMs(350.0), errorRate(0.12), avgEfficiency(0.85) {}
 
-Point p1Dir(0, 0);     // Player1 の現在の進行方向
-bool p1IsMoving = false; // 移動中フラグ
+    void loadStyles(const char* filename) {
+        FILE* fp = fopen(filename, "r");
+        if (!fp) return;
 
-Point p2Dir(0, 0);     // Player2 の現在の進行方向
-bool p2IsMoving = false;
+        DWORD totalIntersections = 0;
+        DWORD totalWrongTurns = 0;
+        double totalReactionTime = 0.0;
+        double totalEfficiency = 0.0;
+        int recordCount = 0;
 
-int p1Steps = 0;
-int p2Steps = 0;
-DWORD startTime = 0;
-DWORD elapsedTime = 0;
+        char hexBuf[256];
+        while (fgets(hexBuf, sizeof(hexBuf), fp)) {
+            GameRecordBinary rec;
+            BYTE* pRec = (BYTE*)&rec;
+            int len = (int)strlen(hexBuf);
 
-GameMode currentMode = MODE_VS_AI;
-int aiLevel = 5;      // デフォルト Lv.5
-int mazeLevel = 5;    // 1 ? 10
-bool gameOver = false;
-int winner = 0;
+            for (size_t i = 0; i < sizeof(GameRecordBinary) && (i * 2 + 1) < (size_t)len; ++i) {
+                unsigned int val = 0;
+                sscanf(hexBuf + i * 2, "%02x", &val);
+                pRec[i] = (BYTE)val;
+            }
 
-// カウントダウン用
-bool isCountingDown = false;
-int countdownValue = 3;
+            totalIntersections += rec.intersectionCount;
+            totalWrongTurns += rec.wrongTurnsCount;
+            totalReactionTime += rec.totalReactionTimeMs;
+            totalEfficiency += rec.pathEfficiencyRatio;
+            recordCount++;
+        }
+        fclose(fp);
 
-// 思考ラグ計測用変数
-DWORD stopStartTime = 0;  // 停止（思考開始）時刻
-bool isP1Stopped = true;  // 停止中かどうか（移動中以外＝思考中）
-int currentIntersectionCount = 0;
-double currentReactionTimeMs = 0.0;
-int currentWrongTurnsCount = 0;
+        if (totalIntersections > 0) {
+            avgReactionMs = totalReactionTime / (double)totalIntersections;
+            errorRate = (double)totalWrongTurns / (double)totalIntersections;
+            if (errorRate > 0.5) errorRate = 0.5;
+        }
+        if (recordCount > 0) {
+            avgEfficiency = totalEfficiency / (double)recordCount;
+            if (avgEfficiency < 0.4) avgEfficiency = 0.4;
+            if (avgEfficiency > 1.0) avgEfficiency = 1.0;
+        }
+    }
 
-// 学習済みの基準値
-double humanAvgReactionMs = 400.0;
-double humanErrorRate = 0.15;
+    void saveCurrentStyle(const char* filename, const GameRecordBinary& rec) const {
+        FILE* fp = fopen(filename, "a");
+        if (!fp) return;
 
-// AI思考待ち用タイマー状態
-DWORD aiWaitUntil = 0;
+        const BYTE* pRec = (const BYTE*)&rec;
+        for (size_t i = 0; i < sizeof(GameRecordBinary); ++i) {
+            fprintf(fp, "%02X", pRec[i]);
+        }
+        fprintf(fp, "\n");
+        fclose(fp);
+    }
+};
 
-// UIハンドル
-HWND hComboMode = NULL;
-HWND hComboAI = NULL;
-HWND hComboMaze = NULL;
-HWND hBtnStart = NULL;
+// ==========================================
+// 迷路データ＆アルゴリズム管理クラス
+// ==========================================
+class Maze {
+public:
+    int width;
+    int height;
+    vector<vector<int> > grid;
+    Point goalPos;
 
-// 別の方向へ曲がれるか（進行方向変更が可能か）の判定
-bool canChangeDirection(Point pos, Point currentDir) {
-    if (currentDir.x == 0 && currentDir.y == 0) return true;
+    Maze() : width(21), height(15), goalPos(1, 1) {}
 
-    Point leftDir(-currentDir.y, currentDir.x);
-    Point rightDir(currentDir.y, -currentDir.x);
+    void updateSizeByLevel(int level) {
+        width = 11 + (level - 1) * 2 + 2;
+        if (width % 2 == 0) width++;
 
-    Point leftPos(pos.x + leftDir.x, pos.y + leftDir.y);
-    Point rightPos(pos.x + rightDir.x, pos.y + rightDir.y);
+        height = 9 + (level - 1) * 2;
+        if (height % 2 == 0) height++;
 
-    bool leftOpen = (leftPos.x >= 0 && leftPos.x < mazeW && leftPos.y >= 0 && leftPos.y < mazeH && maze[leftPos.y][leftPos.x] != 1);
-    bool rightOpen = (rightPos.x >= 0 && rightPos.x < mazeW && rightPos.y >= 0 && rightPos.y < mazeH && maze[rightPos.y][rightPos.x] != 1);
+        goalPos = Point(width - 2, height - 2);
+    }
 
-    Point frontPos(pos.x + currentDir.x, pos.y + currentDir.y);
-    bool frontBlocked = (frontPos.x < 0 || frontPos.x >= mazeW || frontPos.y < 0 || frontPos.y >= mazeH || maze[frontPos.y][frontPos.x] == 1);
+    void generate(int level) {
+        updateSizeByLevel(level);
+        grid.assign(height, vector<int>(width, 1));
 
-    return (leftOpen || rightOpen || frontBlocked);
-}
+        vector<Point> stack;
+        grid[1][1] = 0;
+        stack.push_back(Point(1, 1));
 
-// 統合16進数ログから全試合データを読み込み
-void loadAllPlayerStyles() {
-    FILE* fp = fopen(LOG_FILE_NAME, "r");
-    if (!fp) return;
+        int dx[] = { 0, 0, 2, -2 };
+        int dy[] = { 2, -2, 0, 0 };
 
-    UINT64 totalIntersections = 0;
-    UINT64 totalWrongTurns = 0;
-    double totalReactionTime = 0.0;
+        while (!stack.empty()) {
+            size_t idx = (rand() % 100 < 70) ? stack.size() - 1 : rand() % stack.size();
+            Point current = stack[idx];
 
-    char hexBuf[256];
-    while (fgets(hexBuf, sizeof(hexBuf), fp)) {
-        GameRecordBinary rec;
-        unsigned char* pRec = (unsigned char*)&rec;
-        int len = (int)strlen(hexBuf);
+            vector<int> neighbors;
+            for (int i = 0; i < 4; ++i) {
+                int nx = current.x + dx[i];
+                int ny = current.y + dy[i];
+                if (nx > 0 && nx < width - 1 && ny > 0 && ny < height - 1) {
+                    if (grid[ny][nx] == 1) {
+                        neighbors.push_back(i);
+                    }
+                }
+            }
 
-        for (int i = 0; i < (int)sizeof(GameRecordBinary) && (i * 2 + 1) < len; ++i) {
-            unsigned int val = 0;
-            sscanf(hexBuf + i * 2, "%02x", &val);
-            pRec[i] = (unsigned char)val;
+            if (!neighbors.empty()) {
+                int dir = neighbors[rand() % neighbors.size()];
+                int nx = current.x + dx[dir];
+                int ny = current.y + dy[dir];
+
+                grid[current.y + dy[dir] / 2][current.x + dx[dir] / 2] = 0;
+                grid[ny][nx] = 0;
+                stack.push_back(Point(nx, ny));
+            } else {
+                stack.erase(stack.begin() + idx);
+            }
         }
 
-        totalIntersections += rec.intersectionCount;
-        totalWrongTurns += rec.wrongTurnsCount;
-        totalReactionTime += rec.totalReactionTimeMs;
-    }
-    fclose(fp);
+        int loopCount = 1 + (level / 4);
+        for (int i = 0; i < loopCount; ++i) {
+            int rx = 1 + (rand() % (width - 2));
+            int ry = 1 + (rand() % (height - 2));
 
-    if (totalIntersections > 0) {
-        humanAvgReactionMs = totalReactionTime / totalIntersections;
-        humanErrorRate = (double)totalWrongTurns / (double)totalIntersections;
-        if (humanErrorRate > 0.6) humanErrorRate = 0.6;
-    }
-}
-
-// 今回の試合結果を統合ログへ追記保存
-void saveCurrentPlayerStyleHex() {
-    GameRecordBinary rec;
-    rec.totalSteps = (UINT32)p1Steps;
-    rec.clearTimeMs = (UINT32)elapsedTime;
-    rec.intersectionCount = (UINT32)currentIntersectionCount;
-    rec.wrongTurnsCount = (UINT32)currentWrongTurnsCount;
-    rec.totalReactionTimeMs = currentReactionTimeMs;
-
-    FILE* fp = fopen(LOG_FILE_NAME, "a");
-    if (!fp) return;
-
-    unsigned char* pRec = (unsigned char*)&rec;
-    for (size_t i = 0; i < sizeof(GameRecordBinary); ++i) {
-        fprintf(fp, "%02X", pRec[i]);
-    }
-    fprintf(fp, "\n");
-    fclose(fp);
-}
-
-void updateMazeSizeByLevel() {
-    mazeW = 11 + (mazeLevel - 1) * 2 + 2; 
-    if (mazeW % 2 == 0) mazeW++;
-
-    mazeH = 9 + (mazeLevel - 1) * 2;
-    if (mazeH % 2 == 0) mazeH++;
-
-    goalPos = Point(mazeW - 2, mazeH - 2);
-}
-
-// 適度な難易度と視認性を重視したバランス型迷路生成
-void generateMaze() {
-    updateMazeSizeByLevel();
-    maze.assign(mazeH, vector<int>(mazeW, 1));
-
-    vector<Point> stack;
-    maze[1][1] = 0;
-    stack.push_back(Point(1, 1));
-
-    int dx[] = {0, 0, 2, -2};
-    int dy[] = {2, -2, 0, 0};
-
-    while (!stack.empty()) {
-        // 70%の確率で直近のパスを深掘り（見通しの良さを維持）、30%で分岐（適度な迷い要素）
-        int idx = (rand() % 100 < 70) ? (int)stack.size() - 1 : rand() % stack.size();
-        Point current = stack[idx];
-
-        vector<int> neighbors;
-        for (int i = 0; i < 4; ++i) {
-            int nx = current.x + dx[i];
-            int ny = current.y + dy[i];
-            if (nx > 0 && nx < mazeW - 1 && ny > 0 && ny < mazeH - 1) {
-                if (maze[ny][nx] == 1) {
-                    neighbors.push_back(i);
+            if (grid[ry][rx] == 1) {
+                if (grid[ry - 1][rx] == 0 && grid[ry + 1][rx] == 0) {
+                    grid[ry][rx] = 0;
+                } else if (grid[ry][rx - 1] == 0 && grid[ry][rx + 1] == 0) {
+                    grid[ry][rx] = 0;
                 }
             }
         }
 
-        if (!neighbors.empty()) {
-            int dir = neighbors[rand() % neighbors.size()];
-            int nx = current.x + dx[dir];
-            int ny = current.y + dy[dir];
-
-            maze[current.y + dy[dir] / 2][current.x + dx[dir] / 2] = 0;
-            maze[ny][nx] = 0;
-            stack.push_back(Point(nx, ny));
-        } else {
-            stack.erase(stack.begin() + idx);
-        }
+        grid[goalPos.y][goalPos.x] = 2;
     }
 
-    // わずかに1?2箇所の抜け道を作ることで行き止まり感を軽減
-    int loopCount = 1 + (mazeLevel / 4);
-    for (int i = 0; i < loopCount; ++i) {
-        int rx = 1 + (rand() % (mazeW - 2));
-        int ry = 1 + (rand() % (mazeH - 2));
+    bool isWall(int x, int y) const {
+        if (x < 0 || x >= width || y < 0 || y >= height) return true;
+        return grid[y][x] == 1;
+    }
 
-        if (maze[ry][rx] == 1) {
-            if (maze[ry - 1][rx] == 0 && maze[ry + 1][rx] == 0) {
-                maze[ry][rx] = 0;
-            } else if (maze[ry][rx - 1] == 0 && maze[ry][rx + 1] == 0) {
-                maze[ry][rx] = 0;
+    bool canChangeDirection(Point pos, Point currentDir) const {
+        if (currentDir.x == 0 && currentDir.y == 0) return true;
+
+        Point leftDir(-currentDir.y, currentDir.x);
+        Point rightDir(currentDir.y, -currentDir.x);
+
+        bool leftOpen = !isWall(pos.x + leftDir.x, pos.y + leftDir.y);
+        bool rightOpen = !isWall(pos.x + rightDir.x, pos.y + rightDir.y);
+        bool frontBlocked = isWall(pos.x + currentDir.x, pos.y + currentDir.y);
+
+        return (leftOpen || rightOpen || frontBlocked);
+    }
+
+    vector<Point> getShortestPath(Point start, Point target) const {
+        vector<vector<Point> > parent(height, vector<Point>(width, Point(-1, -1)));
+        vector<vector<bool> > visited(height, vector<bool>(width, false));
+        queue<Point> q;
+
+        q.push(start);
+        visited[start.y][start.x] = true;
+
+        int dx[] = { 0, 0, 1, -1 };
+        int dy[] = { 1, -1, 0, 0 };
+
+        bool found = false;
+        while (!q.empty()) {
+            Point curr = q.front();
+            q.pop();
+
+            if (curr == target) {
+                found = true;
+                break;
             }
-        }
-    }
 
-    maze[goalPos.y][goalPos.x] = 2;
-}
+            for (int i = 0; i < 4; ++i) {
+                int nx = curr.x + dx[i];
+                int ny = curr.y + dy[i];
 
-void resizeWindowToFit(HWND hWnd) {
-    int mazePixelWidth = mazeW * CELL_SIZE;
-    int winWidth = MARGIN * 3 + mazePixelWidth * 2 + 32;
-    if (winWidth < 540) winWidth = 540;
-    int winHeight = TOP_PANEL + mazeH * CELL_SIZE + MARGIN + 70;
-
-    SetWindowPos(hWnd, NULL, 0, 0, winWidth, winHeight, SWP_NOMOVE | SWP_NOZORDER);
-}
-
-void resetGame(HWND hWnd) {
-    if (hComboMode) {
-        int modeIdx = (int)SendMessage(hComboMode, CB_GETCURSEL, 0, 0);
-        currentMode = (modeIdx == 1) ? MODE_VS_HUMAN : MODE_VS_AI;
-    }
-    if (hComboAI) {
-        aiLevel = (int)SendMessage(hComboAI, CB_GETCURSEL, 0, 0) + 1;
-    }
-    if (hComboMaze) {
-        mazeLevel = (int)SendMessage(hComboMaze, CB_GETCURSEL, 0, 0) + 1;
-    }
-
-    loadAllPlayerStyles();
-    generateMaze();
-    resizeWindowToFit(hWnd);
-
-    p1Pos = Point(1, 1);
-    p2Pos = Point(1, 1);
-    p1Dir = Point(0, 0);
-    p2Dir = Point(0, 0);
-    p1IsMoving = false;
-    p2IsMoving = false;
-
-    aiLastPos = Point(1, 1);
-    p1Steps = 0;
-    p2Steps = 0;
-    elapsedTime = 0;
-    gameOver = false;
-    winner = 0;
-
-    currentIntersectionCount = 0;
-    currentReactionTimeMs = 0.0;
-    currentWrongTurnsCount = 0;
-
-    stopStartTime = GetTickCount();
-    isP1Stopped = true;
-    aiWaitUntil = 0;
-
-    KillTimer(hWnd, TIMER_AI);
-    KillTimer(hWnd, TIMER_PLAYER);
-    KillTimer(hWnd, TIMER_CLOCK);
-
-    isCountingDown = true;
-    countdownValue = 3;
-    SetTimer(hWnd, TIMER_COUNTDOWN, 1000, NULL);
-
-    InvalidateRect(hWnd, NULL, FALSE);
-}
-
-vector<Point> getShortestPath(Point start, Point goal) {
-    vector<vector<Point> > parent(mazeH, vector<Point>(mazeW, Point(-1, -1)));
-    vector<vector<bool> > visited(mazeH, vector<bool>(mazeW, false));
-    queue<Point> q;
-
-    q.push(start);
-    visited[start.y][start.x] = true;
-
-    int dx[] = {0, 0, 1, -1};
-    int dy[] = {1, -1, 0, 0};
-
-    bool found = false;
-    while (!q.empty()) {
-        Point curr = q.front();
-        q.pop();
-
-        if (curr == goal) {
-            found = true;
-            break;
-        }
-
-        for (int i = 0; i < 4; ++i) {
-            int nx = curr.x + dx[i];
-            int ny = curr.y + dy[i];
-
-            if (nx >= 0 && nx < mazeW && ny >= 0 && ny < mazeH) {
-                if (maze[ny][nx] != 1 && !visited[ny][nx]) {
-                    visited[ny][nx] = true;
-                    parent[ny][nx] = curr;
-                    q.push(Point(nx, ny));
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                    if (grid[ny][nx] != 1 && !visited[ny][nx]) {
+                        visited[ny][nx] = true;
+                        parent[ny][nx] = curr;
+                        q.push(Point(nx, ny));
+                    }
                 }
             }
         }
-    }
 
-    vector<Point> path;
-    if (found) {
-        Point curr = goal;
-        while (!(curr == start)) {
-            path.push_back(curr);
-            curr = parent[curr.y][curr.x];
+        vector<Point> path;
+        if (found) {
+            Point curr = target;
+            while (curr != start) {
+                path.push_back(curr);
+                curr = parent[curr.y][curr.x];
+            }
+            reverse(path.begin(), path.end());
         }
-        reverse(path.begin(), path.end());
+        return path;
     }
-    return path;
-}
+};
 
+// ==========================================
+// グローバル状態
+// ==========================================
+Maze g_maze;
+PlayerStyleTracker g_tracker;
+
+Point g_p1Pos(1, 1);
+Point g_p2Pos(1, 1);
+Point g_aiLastPos(1, 1);
+
+Point g_p1Dir(0, 0);
+bool g_p1IsMoving = false;
+
+Point g_p2Dir(0, 0);
+bool g_p2IsMoving = false;
+
+int g_p1Steps = 0;
+int g_p2Steps = 0;
+
+DWORD g_startTime = 0;
+DWORD g_elapsedTime = 0;
+
+GameMode g_currentMode = MODE_VS_AI;
+int g_aiLevel = 5;
+int g_mazeLevel = 5;
+bool g_enableFog = false; // 視界制限フラグ
+bool g_gameOver = false;
+int g_winner = 0;
+
+bool g_isCountingDown = false;
+int g_countdownValue = 3;
+
+DWORD g_stopStartTime = 0;
+bool g_isP1Stopped = true;
+int g_currentIntersectionCount = 0;
+double g_currentReactionTimeMs = 0.0;
+int g_currentWrongTurnsCount = 0;
+
+DWORD g_aiWaitUntil = 0;
+
+// UI ハンドル
+HWND g_hComboMode = NULL;
+HWND g_hComboAI   = NULL;
+HWND g_hComboMaze = NULL;
+HWND g_hChkFog    = NULL;
+HWND g_hBtnStart  = NULL;
+
+// ==========================================
+// AI ロジック (Lv.5 = プレイヤー同等モデル)
+// ==========================================
 Point getNextAIMove() {
     DWORD now = GetTickCount();
-    if (now < aiWaitUntil) {
-        return p2Pos;
+    if (now < g_aiWaitUntil) {
+        return g_p2Pos;
     }
 
-    int dx[] = {0, 0, 1, -1};
-    int dy[] = {1, -1, 0, 0};
+    int dx[] = { 0, 0, 1, -1 };
+    int dy[] = { 1, -1, 0, 0 };
     vector<Point> validMoves;
 
     for (int i = 0; i < 4; ++i) {
-        int nx = p2Pos.x + dx[i];
-        int ny = p2Pos.y + dy[i];
-        if (nx >= 0 && nx < mazeW && ny >= 0 && ny < mazeH && maze[ny][nx] != 1) {
+        int nx = g_p2Pos.x + dx[i];
+        int ny = g_p2Pos.y + dy[i];
+        if (!g_maze.isWall(nx, ny)) {
             validMoves.push_back(Point(nx, ny));
         }
     }
 
-    if (validMoves.empty()) return p2Pos;
+    if (validMoves.empty()) return g_p2Pos;
 
-    if (canChangeDirection(p2Pos, p2Dir)) {
+    // 分岐点での思考ディレイの再現
+    if (g_maze.canChangeDirection(g_p2Pos, g_p2Dir)) {
         double thinkingFactor = 1.0;
-        if (aiLevel == 5) thinkingFactor = 1.0;
-        else if (aiLevel < 5) thinkingFactor = 1.0 + (5 - aiLevel) * 0.3;
-        else thinkingFactor = (10.0 - aiLevel) / 5.0;
+        if (g_aiLevel == 5) {
+            thinkingFactor = 1.0; // プレイヤーの思考時間そのまま
+        } else if (g_aiLevel < 5) {
+            thinkingFactor = 1.0 + (5 - g_aiLevel) * 0.35; // 遅くなる
+        } else {
+            thinkingFactor = (10.0 - g_aiLevel) / 5.0; // 高速化
+        }
 
-        DWORD delayTime = (DWORD)(humanAvgReactionMs * thinkingFactor);
-        if (delayTime > 0 && aiWaitUntil == 0) {
-            aiWaitUntil = now + delayTime;
-            return p2Pos;
+        DWORD delayTime = (DWORD)(g_tracker.avgReactionMs * thinkingFactor);
+        if (delayTime > 0 && g_aiWaitUntil == 0) {
+            g_aiWaitUntil = now + delayTime;
+            return g_p2Pos;
         }
     }
-    aiWaitUntil = 0;
+    g_aiWaitUntil = 0;
 
-    vector<Point> path = getShortestPath(p2Pos, goalPos);
+    vector<Point> path = g_maze.getShortestPath(g_p2Pos, g_maze.goalPos);
 
-    double currentMissChance = humanErrorRate * 100.0;
-    if (aiLevel < 5) {
-        currentMissChance += (5 - aiLevel) * 12.0;
-    } else if (aiLevel > 5) {
-        currentMissChance -= (aiLevel - 5) * (currentMissChance / 5.0);
+    // エラー率（曲がり角での判断ミス・遠回り）の調整
+    double missChance = g_tracker.errorRate * 100.0;
+    if (g_aiLevel < 5) {
+        missChance += (5 - g_aiLevel) * 12.0;
+    } else if (g_aiLevel > 5) {
+        missChance -= (g_aiLevel - 5) * (missChance / 5.0);
     }
-    if (currentMissChance < 0) currentMissChance = 0;
 
-    if (!path.empty() && (rand() % 100 >= (int)currentMissChance)) {
+    // 移動効率（無駄な回り道の再現）
+    if (g_aiLevel == 5 && (rand() % 100 > (int)(g_tracker.avgEfficiency * 100.0))) {
+        missChance += 15.0; 
+    }
+
+    if (missChance < 0) missChance = 0;
+
+    // 最適解を選択
+    if (!path.empty() && (rand() % 100 >= (int)missChance)) {
         return path[0];
     }
 
+    // 迷った場合の移動（後退回避）
     vector<Point> forwardMoves;
     for (size_t i = 0; i < validMoves.size(); ++i) {
-        if (!(validMoves[i] == aiLastPos)) forwardMoves.push_back(validMoves[i]);
+        if (validMoves[i] != g_aiLastPos) forwardMoves.push_back(validMoves[i]);
     }
 
     if (!forwardMoves.empty()) return forwardMoves[rand() % forwardMoves.size()];
     return validMoves[rand() % validMoves.size()];
 }
 
+// ==========================================
+// ゲーム制御関数
+// ==========================================
+void saveRecord() {
+    GameRecordBinary rec;
+    rec.totalSteps = (DWORD)g_p1Steps;
+    rec.clearTimeMs = (DWORD)g_elapsedTime;
+    rec.intersectionCount = (DWORD)g_currentIntersectionCount;
+    rec.wrongTurnsCount = (DWORD)g_currentWrongTurnsCount;
+    rec.totalReactionTimeMs = g_currentReactionTimeMs;
+
+    // 最短経路ステップ数の算出
+    vector<Point> minPath = g_maze.getShortestPath(Point(1, 1), g_maze.goalPos);
+    if (g_p1Steps > 0 && !minPath.empty()) {
+        rec.pathEfficiencyRatio = (double)minPath.size() / (double)g_p1Steps;
+    } else {
+        rec.pathEfficiencyRatio = 1.0;
+    }
+
+    g_tracker.saveCurrentStyle(LOG_FILE_NAME, rec);
+}
+
+void resizeWindowToFit(HWND hWnd) {
+    int mazePixelWidth = g_maze.width * CELL_SIZE;
+    int winWidth = MARGIN * 3 + mazePixelWidth * 2 + 32;
+    if (winWidth < 620) winWidth = 620;
+    int winHeight = TOP_PANEL + g_maze.height * CELL_SIZE + MARGIN + 70;
+
+    SetWindowPos(hWnd, NULL, 0, 0, winWidth, winHeight, SWP_NOMOVE | SWP_NOZORDER);
+}
+
+void resetGame(HWND hWnd) {
+    if (g_hComboMode) {
+        int modeIdx = (int)SendMessage(g_hComboMode, CB_GETCURSEL, 0, 0);
+        g_currentMode = (modeIdx == 1) ? MODE_VS_HUMAN : MODE_VS_AI;
+    }
+    if (g_hComboAI) {
+        g_aiLevel = (int)SendMessage(g_hComboAI, CB_GETCURSEL, 0, 0) + 1;
+    }
+    if (g_hComboMaze) {
+        g_mazeLevel = (int)SendMessage(g_hComboMaze, CB_GETCURSEL, 0, 0) + 1;
+    }
+    if (g_hChkFog) {
+        g_enableFog = (SendMessage(g_hChkFog, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    }
+
+    g_tracker.loadStyles(LOG_FILE_NAME);
+    g_maze.generate(g_mazeLevel);
+    resizeWindowToFit(hWnd);
+
+    g_p1Pos = Point(1, 1);
+    g_p2Pos = Point(1, 1);
+    g_p1Dir = Point(0, 0);
+    g_p2Dir = Point(0, 0);
+    g_p1IsMoving = false;
+    g_p2IsMoving = false;
+
+    g_aiLastPos = Point(1, 1);
+    g_p1Steps = 0;
+    g_p2Steps = 0;
+    g_elapsedTime = 0;
+    g_gameOver = false;
+    g_winner = 0;
+
+    g_currentIntersectionCount = 0;
+    g_currentReactionTimeMs = 0.0;
+    g_currentWrongTurnsCount = 0;
+
+    g_stopStartTime = GetTickCount();
+    g_isP1Stopped = true;
+    g_aiWaitUntil = 0;
+
+    KillTimer(hWnd, TIMER_AI);
+    KillTimer(hWnd, TIMER_PLAYER);
+    KillTimer(hWnd, TIMER_CLOCK);
+
+    g_isCountingDown = true;
+    g_countdownValue = 3;
+    SetTimer(hWnd, TIMER_COUNTDOWN, 1000, NULL);
+
+    InvalidateRect(hWnd, NULL, FALSE);
+}
+
+// ==========================================
+// 描画ロジック (視界制限対応)
+// ==========================================
 void drawSingleMaze(HDC hdc, int offsetX, int offsetY, Point playerPos, COLORREF playerColor, int steps, const char* title) {
-    int mazeWidthPx = mazeW * CELL_SIZE;
-    int mazeHeightPx = mazeH * CELL_SIZE;
+    int mazeWidthPx = g_maze.width * CELL_SIZE;
+    int mazeHeightPx = g_maze.height * CELL_SIZE;
 
     HBRUSH cardBg = CreateSolidBrush(RGB(35, 41, 54));
     HPEN cardBorder = CreatePen(PS_SOLID, 1, RGB(55, 65, 85));
@@ -422,22 +499,33 @@ void drawSingleMaze(HDC hdc, int offsetX, int offsetY, Point playerPos, COLORREF
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(220, 225, 235));
-    TextOut(hdc, offsetX, offsetY - 22, title, strlen(title));
+    TextOut(hdc, offsetX, offsetY - 22, title, (int)strlen(title));
 
     char stepBuf[32];
     sprintf(stepBuf, "歩数: %d", steps);
     SetTextColor(hdc, RGB(140, 150, 170));
-    TextOut(hdc, offsetX + mazeWidthPx - 65, offsetY - 22, stepBuf, strlen(stepBuf));
+    TextOut(hdc, offsetX + mazeWidthPx - 65, offsetY - 22, stepBuf, (int)strlen(stepBuf));
 
-    for (int y = 0; y < mazeH; ++y) {
-        for (int x = 0; x < mazeW; ++x) {
+    for (int y = 0; y < g_maze.height; ++y) {
+        for (int x = 0; x < g_maze.width; ++x) {
+            // 視界制限判定: 半径2マス圏内（距離 2.5 未満）かどうか
+            bool inSight = true;
+            if (g_enableFog) {
+                double dist = sqrt(pow((double)(x - playerPos.x), 2.0) + pow((double)(y - playerPos.y), 2.0));
+                if (dist > 2.5) {
+                    inSight = false;
+                }
+            }
+
             HBRUSH hBrush;
-            if (maze[y][x] == 1) {
-                hBrush = CreateSolidBrush(RGB(20, 24, 32));
-            } else if (maze[y][x] == 2) {
-                hBrush = CreateSolidBrush(RGB(255, 193, 7));
+            if (!inSight) {
+                hBrush = CreateSolidBrush(RGB(15, 17, 22)); // 暗闇
+            } else if (g_maze.grid[y][x] == 1) {
+                hBrush = CreateSolidBrush(RGB(20, 24, 32)); // 壁
+            } else if (g_maze.grid[y][x] == 2) {
+                hBrush = CreateSolidBrush(RGB(255, 193, 7)); // ゴール
             } else {
-                hBrush = CreateSolidBrush(RGB(48, 56, 70));
+                hBrush = CreateSolidBrush(RGB(48, 56, 70)); // 通路
             }
 
             RECT rect = {
@@ -451,6 +539,7 @@ void drawSingleMaze(HDC hdc, int offsetX, int offsetY, Point playerPos, COLORREF
         }
     }
 
+    // プレイヤー描画
     HBRUSH pBrush = CreateSolidBrush(playerColor);
     HPEN pPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
     SelectObject(hdc, pBrush);
@@ -502,26 +591,27 @@ void OnPaint(HWND hWnd) {
     TextOut(hdcMem, MARGIN + 145, 18, "AIレベル:", 9);
     TextOut(hdcMem, MARGIN + 265, 18, "迷路難易度:", 11);
 
-    DWORD currentSec = (isCountingDown || gameOver) ? (elapsedTime / 1000) : ((GetTickCount() - startTime) / 1000);
-    DWORD currentMs = (isCountingDown || gameOver) ? ((elapsedTime % 1000) / 100) : (((GetTickCount() - startTime) % 1000) / 100);
+    DWORD nowMs = GetTickCount();
+    DWORD currentSec = (g_isCountingDown || g_gameOver) ? (g_elapsedTime / 1000) : ((nowMs - g_startTime) / 1000);
+    DWORD currentMs = (g_isCountingDown || g_gameOver) ? ((g_elapsedTime % 1000) / 100) : (((nowMs - g_startTime) % 1000) / 100);
 
     char infoBuf[256];
-    sprintf(infoBuf, "タイム: %lu.%lus   ", currentSec, currentMs);
+    sprintf(infoBuf, "タイム: %lu.%lus   (AI同等率: %.0f%%)", currentSec, currentMs, g_tracker.avgEfficiency * 100.0);
     SetTextColor(hdcMem, RGB(0, 210, 255));
-    TextOut(hdcMem, MARGIN + 10, 62, infoBuf, strlen(infoBuf));
+    TextOut(hdcMem, MARGIN + 10, 62, infoBuf, (int)strlen(infoBuf));
 
-    int mazePixelWidth = mazeW * CELL_SIZE;
+    int mazePixelWidth = g_maze.width * CELL_SIZE;
     int leftOffsetX = MARGIN + 8;
     int rightOffsetX = MARGIN * 2 + mazePixelWidth + 8;
     int mazeOffsetY = TOP_PANEL + 26;
 
-    drawSingleMaze(hdcMem, leftOffsetX, mazeOffsetY, p1Pos, RGB(0, 168, 255), p1Steps, "PLAYER 1 (左: WASD)");
+    drawSingleMaze(hdcMem, leftOffsetX, mazeOffsetY, g_p1Pos, RGB(0, 168, 255), g_p1Steps, "PLAYER 1 (左: WASD)");
 
-    COLORREF rightColor = (currentMode == MODE_VS_AI) ? RGB(255, 71, 87) : RGB(46, 213, 115);
-    const char* rightTitle = (currentMode == MODE_VS_AI) ? "AI BOT (右)" : "PLAYER 2 (右: 矢印)";
-    drawSingleMaze(hdcMem, rightOffsetX, mazeOffsetY, p2Pos, rightColor, p2Steps, rightTitle);
+    COLORREF rightColor = (g_currentMode == MODE_VS_AI) ? RGB(255, 71, 87) : RGB(46, 213, 115);
+    const char* rightTitle = (g_currentMode == MODE_VS_AI) ? "AI BOT (右)" : "PLAYER 2 (右: 矢印)";
+    drawSingleMaze(hdcMem, rightOffsetX, mazeOffsetY, g_p2Pos, rightColor, g_p2Steps, rightTitle);
 
-    if (isCountingDown) {
+    if (g_isCountingDown) {
         HFONT hFontCount = CreateFont(52, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                       SHIFTJIS_CHARSET, OUT_DEFAULT_PRECIS,
                                       CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
@@ -531,7 +621,7 @@ void OnPaint(HWND hWnd) {
         int dialogW = 260;
         int dialogH = 100;
         int dialogX = (winRect.right - dialogW) / 2;
-        int dialogY = mazeOffsetY + (mazeH * CELL_SIZE) / 2 - dialogH / 2;
+        int dialogY = mazeOffsetY + (g_maze.height * CELL_SIZE) / 2 - dialogH / 2;
 
         HBRUSH dlgBg = CreateSolidBrush(RGB(20, 24, 32));
         HPEN dlgBorder = CreatePen(PS_SOLID, 2, RGB(0, 210, 255));
@@ -541,8 +631,8 @@ void OnPaint(HWND hWnd) {
         RoundRect(hdcMem, dialogX, dialogY, dialogX + dialogW, dialogY + dialogH, 16, 16);
 
         char countStr[32];
-        if (countdownValue > 0) {
-            sprintf(countStr, "%d", countdownValue);
+        if (g_countdownValue > 0) {
+            sprintf(countStr, "%d", g_countdownValue);
             SetTextColor(hdcMem, RGB(255, 211, 42));
         } else {
             sprintf(countStr, "READY!");
@@ -557,7 +647,7 @@ void OnPaint(HWND hWnd) {
         DeleteObject(dlgBorder);
     }
 
-    if (gameOver) {
+    if (g_gameOver) {
         HFONT hFontWin = CreateFont(26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                     SHIFTJIS_CHARSET, OUT_DEFAULT_PRECIS,
                                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
@@ -567,22 +657,22 @@ void OnPaint(HWND hWnd) {
         int dialogW = 380;
         int dialogH = 70;
         int dialogX = (winRect.right - dialogW) / 2;
-        int dialogY = mazeOffsetY + (mazeH * CELL_SIZE) / 2 - dialogH / 2;
+        int dialogY = mazeOffsetY + (g_maze.height * CELL_SIZE) / 2 - dialogH / 2;
 
         HBRUSH dlgBg = CreateSolidBrush(RGB(20, 24, 32));
-        HPEN dlgBorder = CreatePen(PS_SOLID, 2, (winner == 1) ? RGB(0, 168, 255) : RGB(255, 71, 87));
+        HPEN dlgBorder = CreatePen(PS_SOLID, 2, (g_winner == 1) ? RGB(0, 168, 255) : RGB(255, 71, 87));
         SelectObject(hdcMem, dlgBg);
         SelectObject(hdcMem, dlgBorder);
 
         RoundRect(hdcMem, dialogX, dialogY, dialogX + dialogW, dialogY + dialogH, 16, 16);
 
         char resultStr[128];
-        if (winner == 1) {
+        if (g_winner == 1) {
             sprintf(resultStr, "PLAYER 1 の勝利！");
             SetTextColor(hdcMem, RGB(0, 168, 255));
         } else {
-            if (currentMode == MODE_VS_AI) {
-                sprintf(resultStr, "AI (Lv.%d) の勝利！", aiLevel);
+            if (g_currentMode == MODE_VS_AI) {
+                sprintf(resultStr, "AI (Lv.%d) の勝利！", g_aiLevel);
             } else {
                 sprintf(resultStr, "PLAYER 2 の勝利！");
             }
@@ -600,7 +690,7 @@ void OnPaint(HWND hWnd) {
         SetTextColor(hdcMem, RGB(180, 190, 205));
 
         RECT subTextRect = { dialogX, dialogY + 42, dialogX + dialogW, dialogY + 65 };
-        DrawText(hdcMem, "おつかれさまでした！\nもういっかいあそぶ？", -1, &subTextRect, DT_CENTER);
+        DrawText(hdcMem, "おつかれさでした！\nもういっかいあそぶ？", -1, &subTextRect, DT_CENTER);
 
         DeleteObject(hFontSub);
         DeleteObject(hFontWin);
@@ -620,68 +710,71 @@ void OnPaint(HWND hWnd) {
     EndPaint(hWnd, &ps);
 }
 
+// ==========================================
+// イベント更新・キー入力
+// ==========================================
 void processPlayerStep(HWND hWnd) {
-    if (gameOver || isCountingDown) return;
+    if (g_gameOver || g_isCountingDown) return;
 
     bool moved = false;
 
-    if (p1IsMoving) {
-        Point targetP1(p1Pos.x + p1Dir.x, p1Pos.y + p1Dir.y);
+    if (g_p1IsMoving) {
+        Point targetP1(g_p1Pos.x + g_p1Dir.x, g_p1Pos.y + g_p1Dir.y);
 
-        if (maze[targetP1.y][targetP1.x] != 1) {
-            p1Pos = targetP1;
-            p1Steps++;
+        if (!g_maze.isWall(targetP1.x, targetP1.y)) {
+            g_p1Pos = targetP1;
+            g_p1Steps++;
             moved = true;
 
-            if (canChangeDirection(p1Pos, p1Dir)) {
-                p1IsMoving = false;
-                p1Dir = Point(0, 0);
+            if (g_maze.canChangeDirection(g_p1Pos, g_p1Dir)) {
+                g_p1IsMoving = false;
+                g_p1Dir = Point(0, 0);
 
-                isP1Stopped = true;
-                stopStartTime = GetTickCount();
+                g_isP1Stopped = true;
+                g_stopStartTime = GetTickCount();
             }
         } else {
-            p1IsMoving = false;
-            p1Dir = Point(0, 0);
+            g_p1IsMoving = false;
+            g_p1Dir = Point(0, 0);
 
-            isP1Stopped = true;
-            stopStartTime = GetTickCount();
+            g_isP1Stopped = true;
+            g_stopStartTime = GetTickCount();
         }
     }
 
-    if (p1Pos == goalPos) {
-        gameOver = true;
-        winner = 1;
-        elapsedTime = GetTickCount() - startTime;
-        saveCurrentPlayerStyleHex();
+    if (g_p1Pos == g_maze.goalPos) {
+        g_gameOver = true;
+        g_winner = 1;
+        g_elapsedTime = GetTickCount() - g_startTime;
+        saveRecord();
 
         KillTimer(hWnd, TIMER_AI);
         KillTimer(hWnd, TIMER_PLAYER);
         KillTimer(hWnd, TIMER_CLOCK);
     }
 
-    if (currentMode == MODE_VS_HUMAN && p2IsMoving) {
-        Point targetP2(p2Pos.x + p2Dir.x, p2Pos.y + p2Dir.y);
+    if (g_currentMode == MODE_VS_HUMAN && g_p2IsMoving) {
+        Point targetP2(g_p2Pos.x + g_p2Dir.x, g_p2Pos.y + g_p2Dir.y);
 
-        if (maze[targetP2.y][targetP2.x] != 1) {
-            p2Pos = targetP2;
-            p2Steps++;
+        if (!g_maze.isWall(targetP2.x, targetP2.y)) {
+            g_p2Pos = targetP2;
+            g_p2Steps++;
             moved = true;
 
-            if (canChangeDirection(p2Pos, p2Dir)) {
-                p2IsMoving = false;
-                p2Dir = Point(0, 0);
+            if (g_maze.canChangeDirection(g_p2Pos, g_p2Dir)) {
+                g_p2IsMoving = false;
+                g_p2Dir = Point(0, 0);
             }
         } else {
-            p2IsMoving = false;
-            p2Dir = Point(0, 0);
+            g_p2IsMoving = false;
+            g_p2Dir = Point(0, 0);
         }
 
-        if (p2Pos == goalPos) {
-            gameOver = true;
-            winner = 2;
-            elapsedTime = GetTickCount() - startTime;
-            saveCurrentPlayerStyleHex();
+        if (g_p2Pos == g_maze.goalPos) {
+            g_gameOver = true;
+            g_winner = 2;
+            g_elapsedTime = GetTickCount() - g_startTime;
+            saveRecord();
 
             KillTimer(hWnd, TIMER_AI);
             KillTimer(hWnd, TIMER_PLAYER);
@@ -695,7 +788,7 @@ void processPlayerStep(HWND hWnd) {
 }
 
 void handleKeyPress(WPARAM key) {
-    if (gameOver || isCountingDown) return;
+    if (g_gameOver || g_isCountingDown) return;
 
     Point newDir(0, 0);
     if (key == 'W' || key == 'w') newDir = Point(0, -1);
@@ -704,25 +797,25 @@ void handleKeyPress(WPARAM key) {
     else if (key == 'D' || key == 'd') newDir = Point(1, 0);
 
     if (newDir.x != 0 || newDir.y != 0) {
-        Point target(p1Pos.x + newDir.x, p1Pos.y + newDir.y);
+        Point target(g_p1Pos.x + newDir.x, g_p1Pos.y + newDir.y);
 
-        if (maze[target.y][target.x] != 1) {
-            if (isP1Stopped) {
+        if (!g_maze.isWall(target.x, target.y)) {
+            if (g_isP1Stopped) {
                 DWORD now = GetTickCount();
-                double reactionMs = (double)(now - stopStartTime);
-                currentReactionTimeMs += reactionMs;
-                currentIntersectionCount++;
-                isP1Stopped = false;
+                double reactionMs = (double)(now - g_stopStartTime);
+                g_currentReactionTimeMs += reactionMs;
+                g_currentIntersectionCount++;
+                g_isP1Stopped = false;
             }
 
-            p1Dir = newDir;
-            p1IsMoving = true;
+            g_p1Dir = newDir;
+            g_p1IsMoving = true;
         } else {
-            currentWrongTurnsCount++;
+            g_currentWrongTurnsCount++;
         }
     }
 
-    if (currentMode == MODE_VS_HUMAN) {
+    if (g_currentMode == MODE_VS_HUMAN) {
         Point newDirP2(0, 0);
         if (key == VK_UP) newDirP2 = Point(0, -1);
         else if (key == VK_DOWN) newDirP2 = Point(0, 1);
@@ -730,42 +823,48 @@ void handleKeyPress(WPARAM key) {
         else if (key == VK_RIGHT) newDirP2 = Point(1, 0);
 
         if (newDirP2.x != 0 || newDirP2.y != 0) {
-            Point targetP2(p2Pos.x + newDirP2.x, p2Pos.y + newDirP2.y);
-            if (maze[targetP2.y][targetP2.x] != 1) {
-                p2Dir = newDirP2;
-                p2IsMoving = true;
+            Point targetP2(g_p2Pos.x + newDirP2.x, g_p2Pos.y + newDirP2.y);
+            if (!g_maze.isWall(targetP2.x, targetP2.y)) {
+                g_p2Dir = newDirP2;
+                g_p2IsMoving = true;
             }
         }
     }
 }
 
+// ==========================================
+// Win32 UI作成 ＆ ウィンドウプロシージャ
+// ==========================================
 void createUIControls(HWND hWnd, HINSTANCE hInstance) {
-    hComboMode = CreateWindow("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL,
-                              MARGIN + 55, 14, 80, 120, hWnd, (HMENU)IDC_COMBO_MODE, hInstance, NULL);
-    SendMessage(hComboMode, CB_ADDSTRING, 0, (LPARAM)"VS AI");
-    SendMessage(hComboMode, CB_ADDSTRING, 0, (LPARAM)"VS HUMAN");
-    SendMessage(hComboMode, CB_SETCURSEL, 0, 0);
+    g_hComboMode = CreateWindow("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+                                MARGIN + 55, 14, 80, 120, hWnd, (HMENU)IDC_COMBO_MODE, hInstance, NULL);
+    SendMessage(g_hComboMode, CB_ADDSTRING, 0, (LPARAM)"VS AI");
+    SendMessage(g_hComboMode, CB_ADDSTRING, 0, (LPARAM)"VS HUMAN");
+    SendMessage(g_hComboMode, CB_SETCURSEL, 0, 0);
 
-    hComboAI = CreateWindow("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL,
-                            MARGIN + 215, 14, 45, 200, hWnd, (HMENU)IDC_COMBO_AI, hInstance, NULL);
+    g_hComboAI = CreateWindow("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+                              MARGIN + 215, 14, 45, 200, hWnd, (HMENU)IDC_COMBO_AI, hInstance, NULL);
     for (int i = 1; i <= 10; ++i) {
         char buf[16];
         sprintf(buf, "%d", i);
-        SendMessage(hComboAI, CB_ADDSTRING, 0, (LPARAM)buf);
+        SendMessage(g_hComboAI, CB_ADDSTRING, 0, (LPARAM)buf);
     }
-    SendMessage(hComboAI, CB_SETCURSEL, 4, 0);
+    SendMessage(g_hComboAI, CB_SETCURSEL, 4, 0); // 初期値 Lv.5
 
-    hComboMaze = CreateWindow("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL,
-                              MARGIN + 350, 14, 45, 200, hWnd, (HMENU)IDC_COMBO_MAZE, hInstance, NULL);
+    g_hComboMaze = CreateWindow("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+                                MARGIN + 350, 14, 45, 200, hWnd, (HMENU)IDC_COMBO_MAZE, hInstance, NULL);
     for (int i = 1; i <= 10; ++i) {
         char buf[16];
         sprintf(buf, "%d", i);
-        SendMessage(hComboMaze, CB_ADDSTRING, 0, (LPARAM)buf);
+        SendMessage(g_hComboMaze, CB_ADDSTRING, 0, (LPARAM)buf);
     }
-    SendMessage(hComboMaze, CB_SETCURSEL, 4, 0);
+    SendMessage(g_hComboMaze, CB_SETCURSEL, 4, 0);
 
-    hBtnStart = CreateWindow("BUTTON", "ゲーム開始", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-                             MARGIN + 410, 13, 90, 25, hWnd, (HMENU)IDC_BTN_START, hInstance, NULL);
+    g_hChkFog = CreateWindow("BUTTON", "視界制限", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+                             MARGIN + 405, 14, 85, 22, hWnd, (HMENU)IDC_CHK_FOG, hInstance, NULL);
+
+    g_hBtnStart = CreateWindow("BUTTON", "ゲーム開始", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+                               MARGIN + 495, 13, 90, 25, hWnd, (HMENU)IDC_BTN_START, hInstance, NULL);
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -791,12 +890,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
     case WM_TIMER:
         if (wParam == TIMER_COUNTDOWN) {
-            countdownValue--;
-            if (countdownValue < 0) {
+            g_countdownValue--;
+            if (g_countdownValue < 0) {
                 KillTimer(hWnd, TIMER_COUNTDOWN);
-                isCountingDown = false;
-                startTime = GetTickCount();
-                stopStartTime = startTime;
+                g_isCountingDown = false;
+                g_startTime = GetTickCount();
+                g_stopStartTime = g_startTime;
 
                 SetTimer(hWnd, TIMER_AI, MOVE_SPEED_DELAY, NULL);
                 SetTimer(hWnd, TIMER_PLAYER, MOVE_SPEED_DELAY, NULL);
@@ -804,19 +903,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             InvalidateRect(hWnd, NULL, FALSE);
         }
-        else if (wParam == TIMER_AI && currentMode == MODE_VS_AI && !gameOver && !isCountingDown) {
+        else if (wParam == TIMER_AI && g_currentMode == MODE_VS_AI && !g_gameOver && !g_isCountingDown) {
             Point nextAI = getNextAIMove();
-            if (!(nextAI == p2Pos)) {
-                aiLastPos = p2Pos;
-                p2Pos = nextAI;
-                p2Steps++;
+            if (nextAI != g_p2Pos) {
+                g_aiLastPos = g_p2Pos;
+                g_p2Pos = nextAI;
+                g_p2Steps++;
             }
 
-            if (p2Pos == goalPos) {
-                gameOver = true;
-                winner = 2;
-                elapsedTime = GetTickCount() - startTime;
-                saveCurrentPlayerStyleHex();
+            if (g_p2Pos == g_maze.goalPos) {
+                g_gameOver = true;
+                g_winner = 2;
+                g_elapsedTime = GetTickCount() - g_startTime;
+                saveRecord();
 
                 KillTimer(hWnd, TIMER_AI);
                 KillTimer(hWnd, TIMER_PLAYER);
@@ -824,10 +923,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             InvalidateRect(hWnd, NULL, FALSE);
         }
-        else if (wParam == TIMER_PLAYER && !gameOver && !isCountingDown) {
+        else if (wParam == TIMER_PLAYER && !g_gameOver && !g_isCountingDown) {
             processPlayerStep(hWnd);
         }
-        else if (wParam == TIMER_CLOCK && !gameOver && !isCountingDown) {
+        else if (wParam == TIMER_CLOCK && !g_gameOver && !g_isCountingDown) {
             InvalidateRect(hWnd, NULL, FALSE);
         }
         break;
@@ -850,6 +949,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     return 0;
 }
 
+// ==========================================
+// エントリポイント
+// ==========================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     srand((unsigned int)time(NULL));
 
