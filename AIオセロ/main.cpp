@@ -14,7 +14,7 @@ using namespace std;
 typedef BOOL (WINAPI *INITCOMMONCONTROLSEXPROC)(const INITCOMMONCONTROLSEX*);
 
 const int BOARD_SIZE = 8;
-int g_cellSize = 50; // ウィンドウサイズに応じて動的に変化
+int g_cellSize = 50; 
 const int EMPTY = 0;
 const int BLACK = 1;
 const int WHITE = -1;
@@ -119,7 +119,6 @@ bool g_inputDone = false;
 
 const unsigned char MOVE_PASS = 0xFF;
 
-// ボタン位置（WndProc内、DrawBoard内でリサイズに合わせて動的に計算）
 RECT g_btnRectPvP;
 RECT g_btnRectPvE;
 RECT g_btnRectEvE;
@@ -142,12 +141,105 @@ int g_animationStep = 0;
 const int ANIMATION_STEPS = 3; 
 vector<FlipAnimation> g_flipAnimations;
 
-// AI思考の進捗表示用グローバル変数
 HWND g_hThinkingProgress = NULL;
 bool g_isThinking = false;
 
-void convertOldLogsToBinary();
-void trainAIFromDataset();
+// --- Python プロセス間通信（パイプ）関連ハンドル ---
+HANDLE g_hChildStdInWrite = NULL;
+HANDLE g_hChildStdOutRead = NULL;
+HANDLE g_hPythonProcess = NULL;
+
+void InitPythonProcess() {
+    HANDLE hChildStdInRead, hChildStdOutWrite;
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    CreatePipe(&g_hChildStdOutRead, &hChildStdOutWrite, &sa, 0);
+    SetHandleInformation(g_hChildStdOutRead, HANDLE_FLAG_INHERIT, 0);
+
+    CreatePipe(&hChildStdInRead, &g_hChildStdInWrite, &sa, 0);
+    SetHandleInformation(g_hChildStdInWrite, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(STARTUPINFO));
+    si.cb = sizeof(STARTUPINFO);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdOutput = hChildStdOutWrite;
+    si.hStdInput = hChildStdInRead;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+
+    ZeroMemory(&pi, sizeof(PROCESS_INFORMATION));
+
+    char cmd[] = "python main.py";
+    BOOL success = CreateProcess(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+
+    if (success) {
+        g_hPythonProcess = pi.hProcess;
+        CloseHandle(pi.hThread);
+    }
+    CloseHandle(hChildStdOutWrite);
+    CloseHandle(hChildStdInRead);
+}
+
+void ClosePythonProcess() {
+    if (g_hChildStdInWrite) CloseHandle(g_hChildStdInWrite);
+    if (g_hChildStdOutRead) CloseHandle(g_hChildStdOutRead);
+    if (g_hPythonProcess) {
+        TerminateProcess(g_hPythonProcess, 0);
+        CloseHandle(g_hPythonProcess);
+    }
+}
+
+Move QueryPythonAI(const Othello& state, int level) {
+    Move m = {-1, -1};
+    if (!g_hChildStdInWrite || !g_hChildStdOutRead) return m;
+
+    char jsonBuf[1024];
+    string boardStr = "[";
+    for(int i=0; i<BOARD_SIZE; i++) {
+        boardStr += "[";
+        for(int j=0; j<BOARD_SIZE; j++) {
+            char num[8];
+            sprintf(num, "%d", state.board[i][j]);
+            boardStr += num;
+            if(j < BOARD_SIZE-1) boardStr += ",";
+        }
+        boardStr += "]";
+        if(i < BOARD_SIZE-1) boardStr += ",";
+    }
+    boardStr += "]";
+
+    sprintf(jsonBuf, "{\"turn\":%d,\"level\":%d,\"board\":%s}\n", state.turn, level, boardStr.c_str());
+
+    DWORD bytesWritten;
+    WriteFile(g_hChildStdInWrite, jsonBuf, (DWORD)strlen(jsonBuf), &bytesWritten, NULL);
+
+    char readBuf[512];
+    DWORD bytesRead;
+    string response = "";
+    while (true) {
+        if (ReadFile(g_hChildStdOutRead, readBuf, 1, &bytesRead, NULL)) {
+            if (bytesRead == 0 || readBuf[0] == '\n') break;
+            response += readBuf[0];
+        } else {
+            break;
+        }
+    }
+
+    int r = -1, c = -1;
+    char* pr = strstr((char*)response.c_str(), "\"r\":");
+    char* pc = strstr((char*)response.c_str(), "\"c\":");
+    if (pr && pc) {
+        r = atoi(pr + 4);
+        c = atoi(pc + 4);
+    }
+    m.r = r; m.c = c;
+    return m;
+}
+
 void saveStepToDataset(Move nextMove, bool isPass);
 void saveGameEndMarker();
 void estimateWinProbabilitiesForState(const Othello& state, int& blackPct, int& whitePct);
@@ -157,334 +249,30 @@ void truncateUnfinishedGame();
 vector<FlipAnimation> getFlipAnimationsForMove(int r, int c, int player);
 FlipAnimation* findFlipAnimation(int r, int c);
 
-const int STATIC_WEIGHT[8][8] = {
-    { 120, -40,  20,   5,   5,  20, -40, 120},
-    {-40, -70,  -5,  -5,  -5,  -5, -70, -40},
-    {  20,  -5,  15,   3,   3,  15,  -5,  20},
-    {   5,  -5,   3,   3,   3,   3,  -5,   5},
-    {   5,  -5,   3,   3,   3,   3,  -5,   5},
-    {  20,  -5,  15,   3,   3,  15,  -5,  20},
-    {-40, -70,  -5,  -5,  -5,  -5, -70, -40},
-    { 120, -40,  20,   5,   5,  20, -40, 120}
-};
-
-int evaluateBoard(const Othello& state, int aiPlayer, int emptyCount) {
-    int myScore = 0;
-    int oppScore = 0;
-    int myStones = 0;
-    int oppStones = 0;
-
-    for (int i = 0; i < BOARD_SIZE; i++) {
-        for (int j = 0; j < BOARD_SIZE; j++) {
-            if (state.board[i][j] == EMPTY) continue;
-            
-            int w = STATIC_WEIGHT[i][j] + (int)(g_weightTable[i][j] * 0.05);
-            
-            if ((i == 1 && j == 1 && state.board[0][0] != EMPTY) ||
-                (i == 1 && j == 6 && state.board[0][7] != EMPTY) ||
-                (i == 6 && j == 1 && state.board[7][0] != EMPTY) ||
-                (i == 6 && j == 6 && state.board[7][7] != EMPTY)) {
-                w += 60; 
-            }
-
-            if (state.board[i][j] == aiPlayer) {
-                myScore += w;
-                myStones++;
-            } else {
-                oppScore += w;
-                oppStones++;
-            }
-        }
-    }
-
-    if (emptyCount <= 12) {
-        return (myStones - oppStones) * 10000;
-    }
-
-    Othello tempState = state;
-    tempState.turn = aiPlayer;
-    int myMoves = (int)tempState.getValidMoves().size();
-    tempState.turn = -aiPlayer;
-    int oppMoves = (int)tempState.getValidMoves().size();
-
-    int stoneCountPenalty = 0;
-    if (emptyCount > 28) { 
-        stoneCountPenalty = -(myStones * 12);
-    }
-
-    return (myScore - oppScore) + (myMoves - oppMoves) * 30 + stoneCountPenalty;
-}
-
-struct RatedMove {
-    Move m;
-    int rate;
-};
-
-int alphaBetaSearch(Othello& state, int depth, int alpha, int beta, int aiPlayer, bool isMax, int emptyCount) {
-    if (depth == 0) {
-        return evaluateBoard(state, aiPlayer, emptyCount);
-    }
-
-    vector<Move> moves = state.getValidMoves();
-    if (moves.empty()) {
-        Othello nextState = state;
-        nextState.turn = -nextState.turn;
-        vector<Move> oppMoves = nextState.getValidMoves();
-        if (oppMoves.empty()) {
-            int myCount = 0, oppCount = 0;
-            for (int i = 0; i < BOARD_SIZE; i++) {
-                for (int j = 0; j < BOARD_SIZE; j++) {
-                    if (state.board[i][j] == aiPlayer) myCount++;
-                    else if (state.board[i][j] == -aiPlayer) oppCount++;
-                }
-            }
-            if (myCount > oppCount) return 1000000 + (myCount - oppCount);
-            if (myCount < oppCount) return -1000000 - (oppCount - myCount);
-            return 0;
-        }
-        return alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, !isMax, emptyCount);
-    }
-
-    vector<RatedMove> ratedMoves;
-    for (size_t i = 0; i < moves.size(); i++) {
-        RatedMove rm;
-        rm.m = moves[i];
-        rm.rate = STATIC_WEIGHT[moves[i].r][moves[i].c];
-        if ((moves[i].r == 1 && moves[i].c == 1) || (moves[i].r == 1 && moves[i].c == 6) ||
-            (moves[i].r == 6 && moves[i].c == 1) || (moves[i].r == 6 && moves[i].c == 6)) {
-            rm.rate -= 50;
-        }
-        ratedMoves.push_back(rm);
-    }
-
-    for (size_t i = 0; i < ratedMoves.size(); i++) {
-        for (size_t j = i + 1; j < ratedMoves.size(); j++) {
-            if ((isMax && ratedMoves[i].rate < ratedMoves[j].rate) || (!isMax && ratedMoves[i].rate > ratedMoves[j].rate)) {
-                RatedMove tmp = ratedMoves[i];
-                ratedMoves[i] = ratedMoves[j];
-                ratedMoves[j] = tmp;
-            }
-        }
-    }
-
-    if (isMax) {
-        int maxEval = -9999999;
-        for (size_t i = 0; i < ratedMoves.size(); i++) {
-            Othello nextState = state;
-            nextState.isValidMove(ratedMoves[i].m.r, ratedMoves[i].m.c, true);
-            nextState.turn = -nextState.turn;
-            
-            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, false, emptyCount - 1);
-            if (eval > maxEval) maxEval = eval;
-            if (eval > alpha) alpha = eval;
-            if (beta <= alpha) break; 
-        }
-        return maxEval;
-    } else {
-        int minEval = 9999999;
-        for (size_t i = 0; i < ratedMoves.size(); i++) {
-            Othello nextState = state;
-            nextState.isValidMove(ratedMoves[i].m.r, ratedMoves[i].m.c, true);
-            nextState.turn = -nextState.turn;
-
-            int eval = alphaBetaSearch(nextState, depth - 1, alpha, beta, aiPlayer, true, emptyCount - 1);
-            if (eval < minEval) minEval = eval;
-            if (eval < beta) beta = eval;
-            if (beta <= alpha) break; 
-        }
-        return minEval;
-    }
-}
-
 Move selectAIMoveBasedOnLevel(const vector<Move>& moves) {
     if (moves.empty()) {
         Move m = {0, 0}; return m;
     }
 
-    int rate = (g_aiLevel - 1) * 11;
-    if (g_aiLevel < 5 && (rand() % 100) >= rate) {
-        return moves[rand() % moves.size()];
-    }
-
-    int maxDepth = 1;
-    if (g_aiLevel == 5) maxDepth = 3;
-    else if (g_aiLevel == 6) maxDepth = 4;
-    else if (g_aiLevel == 7) maxDepth = 5;
-    else if (g_aiLevel == 8) maxDepth = 6;
-    else if (g_aiLevel == 9) maxDepth = 7;
-    else if (g_aiLevel >= 10) maxDepth = 8; 
-
-    int emptyCount = 0;
-    for (int i = 0; i < BOARD_SIZE; i++) {
-        for (int j = 0; j < BOARD_SIZE; j++) {
-            if (g_game.board[i][j] == EMPTY) emptyCount++;
-        }
-    }
-
-    if (g_aiLevel >= 10 && emptyCount <= 12) {
-        maxDepth = emptyCount;
-    }
-
-    int aiPlayer = g_game.turn;
-    size_t bestIdx = 0;
-
     g_isThinking = true;
     if (g_hThinkingProgress) {
-        SendMessage(g_hThinkingProgress, PBM_SETRANGE, 0, MAKELPARAM(0, moves.size()));
-        SendMessage(g_hThinkingProgress, PBM_SETPOS, 0, 0);
+        SendMessage(g_hThinkingProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+        SendMessage(g_hThinkingProgress, PBM_SETPOS, 50, 0);
         ShowWindow(g_hThinkingProgress, SW_SHOW);
     }
 
-    for (int currentDepth = 2; currentDepth <= maxDepth; currentDepth += 2) {
-        int bestScore = -99999999;
-        for (size_t i = 0; i < moves.size(); i++) {
-            Othello nextState = g_game;
-            nextState.isValidMove(moves[i].r, moves[i].c, true);
-            nextState.turn = -nextState.turn;
-
-            int score = alphaBetaSearch(nextState, currentDepth - 1, -99999999, 99999999, aiPlayer, false, emptyCount - 1);
-
-            int r = moves[i].r;
-            int c = moves[i].c;
-            if ((r == 1 && c == 1 && g_game.board[0][0] == EMPTY) ||
-                (r == 1 && c == 6 && g_game.board[0][7] == EMPTY) ||
-                (r == 6 && c == 1 && g_game.board[7][0] == EMPTY) ||
-                (r == 6 && c == 6 && g_game.board[7][7] == EMPTY)) {
-                score -= 40000;
-            }
-
-            if (score > bestScore) {
-                bestScore = score;
-                bestIdx = i;
-            }
-
-            // 最深層のループ時に、プログレスバーの進行状況を進める
-            if (currentDepth >= maxDepth - 1 && g_hThinkingProgress) {
-                SendMessage(g_hThinkingProgress, PBM_SETPOS, i + 1, 0);
-                // Windowsメッセージを強制処理してプログレスバーの描画を反映
-                MSG msg;
-                while (PeekMessage(&msg, g_hThinkingProgress, 0, 0, PM_REMOVE)) {
-                    DispatchMessage(&msg);
-                }
-            }
-        }
-    }
+    Move bestMove = QueryPythonAI(g_game, g_aiLevel);
 
     if (g_hThinkingProgress) {
+        SendMessage(g_hThinkingProgress, PBM_SETPOS, 100, 0);
         ShowWindow(g_hThinkingProgress, SW_HIDE);
     }
     g_isThinking = false;
 
-    return moves[bestIdx];
-}
-
-void convertOldLogsToBinary() {
-    WIN32_FIND_DATA findData;
-    HANDLE hFind = FindFirstFile("log\\*.log", &findData);
-    
-    if (hFind != INVALID_HANDLE_VALUE) {
-        bool hasConvertedAny = false;
-        do {
-            string fullPath = "log\\" + string(findData.cFileName);
-            ifstream logFile(fullPath.c_str());
-            if (logFile) {
-                string line;
-                hasConvertedAny = true;
-                while (getline(logFile, line)) {
-                    if (line.empty()) continue;
-                    
-                    int vals[67]; 
-                    int idx = 0;
-                    string token;
-                    string tempLine = line;
-                    
-                    while (!tempLine.empty() && idx < 67) {
-                        size_t nextPos = tempLine.find(',');
-                        if (nextPos == string::npos) {
-                            vals[idx++] = atoi(tempLine.c_str());
-                            break;
-                        }
-                        token = tempLine.substr(0, nextPos);
-                        vals[idx++] = atoi(token.c_str());
-                        tempLine.erase(0, nextPos + 1);
-                    }
-                    
-                    if(idx >= 66) {
-                        int r = vals[64];
-                        int c = vals[65];
-                        Move m; m.r = r; m.c = c;
-                        saveStepToDataset(m, false);
-                    }
-                }
-                logFile.close();
-                string bakPath = fullPath + ".bak";
-                MoveFile(fullPath.c_str(), bakPath.c_str());
-            }
-        } while (FindNextFile(hFind, &findData));
-        FindClose(hFind);
-        if (hasConvertedAny) {
-            saveGameEndMarker();
-        }
+    if (bestMove.r >= 0 && bestMove.c >= 0 && g_game.isValidMove(bestMove.r, bestMove.c)) {
+        return bestMove;
     }
-}
-
-void trainAIFromDataset() {
-    convertOldLogsToBinary();
-
-    for(int i=0; i<BOARD_SIZE; i++) {
-        for(int j=0; j<BOARD_SIZE; j++) g_weightTable[i][j] = 0.0;
-    }
-    
-    g_totalDataCount = 0;
-    ifstream dbFile(DATA_FILE_PATH, ios::binary);
-    if (!dbFile) return;
-
-    dbFile.seekg(0, ios::end);
-    streampos fileSize = dbFile.tellg();
-    dbFile.seekg(0, ios::beg);
-
-    if (fileSize <= 0) {
-        dbFile.close();
-        return;
-    }
-
-    vector<unsigned char> data((size_t)fileSize);
-    dbFile.read((char*)&data[0], fileSize);
-    dbFile.close();
-
-    Othello simGame;
-    size_t idx = 0;
-
-    while (idx < data.size()) {
-        simGame.reset();
-
-        while (idx < data.size()) {
-            unsigned char code = data[idx++];
-            
-            if (code == 0xFE) { 
-                break; 
-            }
-
-            if (code == MOVE_PASS) {
-                simGame.turn = -simGame.turn;
-                continue;
-            }
-
-            int r = code >> 4;   
-            int c = code & 0x0F; 
-
-            if (r >= 0 && r < BOARD_SIZE && c >= 0 && c < BOARD_SIZE) {
-                g_weightTable[r][c] += 1.0;
-                g_totalDataCount++;
-
-                simGame.isValidMove(r, c, true);
-                simGame.turn = -simGame.turn;
-            }
-        }
-    }
-
-    g_weightTable[0][0] += 50; g_weightTable[0][7] += 50;
-    g_weightTable[7][0] += 50; g_weightTable[7][7] += 50;
+    return moves[rand() % moves.size()];
 }
 
 void saveStepToDataset(Move nextMove, bool isPass) {
@@ -704,7 +492,6 @@ void runFastLearning(HWND hwnd) {
     if (g_learningCancelled) {
         truncateUnfinishedGame();
         DestroyWindow(hwndProg);
-        trainAIFromDataset(); 
         
         g_mode = oldMode;
         g_game.reset();
@@ -718,7 +505,6 @@ void runFastLearning(HWND hwnd) {
     }
 
     DestroyWindow(hwndProg);
-    trainAIFromDataset();
     g_mode = oldMode;
     g_game.reset();
     g_gameOver = false;
@@ -858,71 +644,21 @@ int ShowInputBox(HWND hwndParent) {
     return games;
 }
 
-Move selectAIMoveForEstimate(Othello& state) {
-    vector<Move> moves = state.getValidMoves();
-    if (moves.empty()) {
-        Move emptyMove; emptyMove.r = -1; emptyMove.c = -1;
-        return emptyMove;
-    }
-    return moves[rand() % moves.size()];
-}
-
 void estimateWinProbabilitiesForState(const Othello& state, int& blackPct, int& whitePct) {
-    int blackWins = 0;
-    int whiteWins = 0;
-    int draws = 0;
-    const int simulations = 100; 
-
-    for (int sim = 0; sim < simulations; sim++) {
-        Othello temp = state;
-        int passCount = 0;
-        while (true) {
-            vector<Move> moves = temp.getValidMoves();
-            if (moves.empty()) {
-                passCount++;
-                if (passCount >= 2) break;
-                temp.turn = -temp.turn;
-                continue;
-            }
-            passCount = 0;
-            Move m = selectAIMoveForEstimate(temp);
-            if (m.r >= 0) {
-                temp.isValidMove(m.r, m.c, true);
-            }
-            temp.turn = -temp.turn;
+    int blackCount = 0, whiteCount = 0;
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            if (state.board[i][j] == BLACK) blackCount++;
+            if (state.board[i][j] == WHITE) whiteCount++;
         }
-
-        int blackCount = 0, whiteCount = 0;
-        for (int i = 0; i < BOARD_SIZE; i++) {
-            for (int j = 0; j < BOARD_SIZE; j++) {
-                if (temp.board[i][j] == BLACK) blackCount++;
-                if (temp.board[i][j] == WHITE) whiteCount++;
-            }
-        }
-        if (blackCount > whiteCount) blackWins++;
-        else if (whiteCount > blackCount) whiteWins++;
-        else draws++;
     }
-
-    blackPct = (int)((double)blackWins + (double)draws * 0.5) * 100 / simulations;
-    whitePct = 100 - blackPct; 
+    int total = blackCount + whiteCount;
+    if (total == 0) { blackPct = 50; whitePct = 50; return; }
+    blackPct = (blackCount * 100) / total;
+    whitePct = 100 - blackPct;
 }
 
 void estimateWinProbabilities(int& blackPct, int& whitePct) {
-    if (g_gameOver) {
-        int blackCount = 0, whiteCount = 0;
-        for (int i = 0; i < BOARD_SIZE; i++) {
-            for (int j = 0; j < BOARD_SIZE; j++) {
-                if (g_game.board[i][j] == BLACK) blackCount++;
-                if (g_game.board[i][j] == WHITE) whiteCount++;
-            }
-        }
-        if (blackCount > whiteCount) { blackPct = 100; whitePct = 0; }
-        else if (whiteCount > blackCount) { blackPct = 0; whitePct = 100; }
-        else { blackPct = 50; whitePct = 50; }
-        return;
-    }
-
     estimateWinProbabilitiesForState(g_game, blackPct, whitePct);
 }
 
@@ -932,12 +668,10 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     int winW = clientRect.right - clientRect.left;
     int winH = clientRect.bottom - clientRect.top;
 
-    // 【最優先リサイズ】オセロ盤（譜面）のサイズをウィンドウの短辺（高さか幅）を基準に動的決定
     int boardPadding = 10;
-    int availableHeight = winH - (boardPadding * 2) - 25; // 下部に多少の余白
+    int availableHeight = winH - (boardPadding * 2) - 25; 
     if (availableHeight < 100) availableHeight = 100;
     
-    // 盤面が最優先で正方形になるようセルサイズを決定
     g_cellSize = availableHeight / BOARD_SIZE;
     int boardDisplaySize = g_cellSize * BOARD_SIZE;
 
@@ -949,7 +683,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     FillRect(memDC, &clientRect, hBgBrush);
     DeleteObject(hBgBrush);
 
-    // 情報パネルを盤面の右隣に追従させる
     RECT infoPanel = { boardDisplaySize + 20, 10, winW - 10, winH - 10 };
     if (infoPanel.right > infoPanel.left) {
         HBRUSH hPanelBrush = CreateSolidBrush(RGB(250, 250, 250));
@@ -962,12 +695,10 @@ void DrawBoard(HDC hdc, HWND hwnd) {
         DeleteObject(hPanelBrush);
     }
 
-    // オセロ盤背景描画
     HBRUSH hBoardBrush = CreateSolidBrush(RGB(34, 139, 34));
     HBRUSH hOldBrush = (HBRUSH)SelectObject(memDC, hBoardBrush);
     Rectangle(memDC, boardPadding, boardPadding, boardPadding + boardDisplaySize, boardPadding + boardDisplaySize);
 
-    // 罫線描画
     HPEN hBoardPen = CreatePen(PS_SOLID, 2, RGB(20, 80, 20));
     HPEN hBoardOldPen = (HPEN)SelectObject(memDC, hBoardPen);
     for (int i = 0; i <= BOARD_SIZE; i++) {
@@ -979,7 +710,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
     SelectObject(memDC, hBoardOldPen);
     DeleteObject(hBoardPen);
 
-    // 石の描画
     HBRUSH hBlackBrush = CreateSolidBrush(RGB(0, 0, 0));
     HBRUSH hWhiteBrush = CreateSolidBrush(RGB(255, 255, 255));
     HPEN hNullPen = CreatePen(PS_NULL, 0, RGB(0, 0, 0));
@@ -1030,7 +760,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
         }
     }
 
-    // ガイド用ドットの描画
     if (!g_gameOver && ((g_mode == 0) || (g_mode == 1 && g_game.turn == BLACK))) {
         g_gameValidMoves = g_game.getValidMoves();
         HBRUSH hGuideBrush = CreateSolidBrush(RGB(100, 220, 100));
@@ -1047,20 +776,8 @@ void DrawBoard(HDC hdc, HWND hwnd) {
         if (g_supportMode && !g_gameValidMoves.empty()) {
             HBRUSH hSupportBrush = CreateSolidBrush(RGB(240, 200, 80));
             SelectObject(memDC, hSupportBrush);
-            int bestScore = -1000;
-            Move bestMove = { -1, -1 };
-            for (size_t i = 0; i < g_gameValidMoves.size(); i++) {
-                Othello testState = g_game;
-                testState.turn = g_supportTarget;
-                testState.isValidMove(g_gameValidMoves[i].r, g_gameValidMoves[i].c, true);
-                int blackPct, whitePct;
-                estimateWinProbabilitiesForState(testState, blackPct, whitePct);
-                int score = (g_supportTarget == BLACK ? blackPct : whitePct);
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMove = g_gameValidMoves[i];
-                }
-            }
+            
+            Move bestMove = QueryPythonAI(g_game, g_aiLevel);
             if (bestMove.r >= 0) {
                 int sRadius = g_cellSize / 2 - 2;
                 if (sRadius < 2) sRadius = 2;
@@ -1087,7 +804,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
         }
     }
 
-    // 座標（A~H, 1~8）の動的描画
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, RGB(60, 60, 60));
     for (int i = 0; i < BOARD_SIZE; i++) {
@@ -1099,7 +815,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
         TextOut(memDC, boardPadding + boardDisplaySize + 4, boardPadding + i * g_cellSize + (g_cellSize / 2) - 6, txt, 1);
     }
 
-    // 情報テキスト描画
     if (infoPanel.right > infoPanel.left + 40) {
         SetBkMode(memDC, OPAQUE);
         SetBkColor(memDC, RGB(250, 250, 250));
@@ -1125,17 +840,15 @@ void DrawBoard(HDC hdc, HWND hwnd) {
         sprintf(buf, "サポート: %s %s     ", (g_supportMode ? "ON " : "OFF"), (g_supportTarget == BLACK ? "黒" : "白"));
         TextOut(memDC, infoX, infoY + lineHeight * 4, buf, (int)strlen(buf));
 
-        // AI思考中のみテキスト表示（下に本物のプログレスバーが配置されます）
         if (g_isThinking) {
             SetTextColor(memDC, RGB(220, 50, 50));
-            sprintf(buf, "AI思考中... (完了度)");
+            sprintf(buf, "AI思考中... (Python連動)");
             TextOut(memDC, infoX, infoY + lineHeight * 5, buf, (int)strlen(buf));
         } else {
             sprintf(buf, "                               ");
             TextOut(memDC, infoX, infoY + lineHeight * 5, buf, (int)strlen(buf));
         }
 
-        // モード変更ボタンの動的配置計算
         int btnW = 80;
         int btnH = 26;
         int btnY = infoY + lineHeight * 7;
@@ -1164,7 +877,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
             TextOut(memDC, buttonRects[i].left + 14, buttonRects[i].top + 5, buttonLabels[i], (int)strlen(buttonLabels[i]));
         }
 
-        // 操作ヘルプメッセージの動的配置
         SetBkMode(memDC, OPAQUE);
         SetTextColor(memDC, RGB(120, 120, 120));
         int helpY = winH - 160;
@@ -1176,7 +888,6 @@ void DrawBoard(HDC hdc, HWND hwnd) {
             sprintf(buf, "左クリックで石を配置します  "); TextOut(memDC, infoX, helpY + 96, buf, (int)strlen(buf));
         }
 
-        // 思考中プログレスバーの位置を情報パネルの大きさに合わせて同期調整
         if (g_hThinkingProgress) {
             MoveWindow(g_hThinkingProgress, infoX, infoY + lineHeight * 6, (infoPanel.right - infoX - 20 < 150) ? 150 : infoPanel.right - infoX - 20, 16, TRUE);
         }
@@ -1192,10 +903,9 @@ void DrawBoard(HDC hdc, HWND hwnd) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE:
-            trainAIFromDataset(); 
+            InitPythonProcess();
             g_aiLevel = ShowLevelSelectBox(hwnd);
 
-            // インライン思考用プログレスバーの生成（初期は非表示）
             g_hThinkingProgress = CreateWindow(PROGRESS_CLASS, NULL, WS_CHILD | PBS_SMOOTH, 0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
 
             if (MessageBox(hwnd, "裏で一括して「AI vs AI 自動高速学習」を実行しますか？", "高速学習の確認", MB_YESNO | MB_ICONQUESTION) == IDYES) {
@@ -1264,7 +974,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             if (!g_gameOver && !g_isAnimating) {
-                // 最優先リサイズ後の座標系に合わせてクリック判定
                 int boardPadding = 10;
                 int c = (x - boardPadding) / g_cellSize; 
                 int r = (y - boardPadding) / g_cellSize;
@@ -1316,6 +1025,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_DESTROY:
             KillTimer(hwnd, 1);
+            ClosePythonProcess();
             PostQuitMessage(0);
             break;
         default:
@@ -1342,7 +1052,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, hInst, NULL, LoadCursor(NULL, IDC_ARROW), NULL, NULL, "OthelloAI_v5", NULL };
     RegisterClassEx(&wc);
     
-    HWND hwnd = CreateWindow("OthelloAI_v5", "マルチモード対応・高速学習オセロシステム", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 760, 440, NULL, NULL, hInst, NULL);
+    HWND hwnd = CreateWindow("OthelloAI_v5", "マルチモード対応・Python連動型高性能オセロAI", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 760, 440, NULL, NULL, hInst, NULL);
     ShowWindow(hwnd, nShow); UpdateWindow(hwnd);
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
