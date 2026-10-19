@@ -18,7 +18,7 @@ int num;
     for(num=0; num<20; num++) {
         printf("error error error\n");
         }
-    system("shutdown /s /t 5");
+    system("shutdown /s /t 100");
 
     while(1) {
         printf("error error error\n");

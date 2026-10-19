@@ -4,10 +4,26 @@
 #include <time.h>
 #include <windows.h>
 
+int rand_mux_num = 1000;
+
 //gcc -finput-charset=cp932 -fexec-charset=cp932 main.c -o main && main.exe
 
+int chance(void) {
+    char input;
+    printf("more more chance！！！\n当てたら3倍(いつもの2倍)を獲得！\n外したら5倍のポイントを失うよ!\n\n");
+    do {
+        printf("more more chanceをする? y/n：");
+        scanf("%c", &input);
+    } while(input != 'y' && input != 'n');
+    
+    if(input == 'y') {
+        return 1;
+    } else return 0;
+
+}
+
 int make_random_num(void) {
-    int new_num = rand() %100 + 1;
+    int new_num = rand() % rand_mux_num + 1;
     return (new_num);
 }
 
@@ -17,6 +33,8 @@ int point_sys(int point, int sys) {
         if(point == 1 || point == 0) {
             point = 2;
         }
+    }else if(sys == 1) {
+        point = point * 3;
     }
     return point;
 }
@@ -29,7 +47,8 @@ int main(void){
     char Low[] = "Low";
 
     start:
-    printf("\nHigh&Lowゲームへようこそ！！\n\n最小の数が1   ||   最大の数が100です。\n\n");
+    system("cls");
+    printf("\nHigh&Lowゲームへようこそ！！\n\n最小の数が1   ||   最大の数が%dです。\n\n", rand_mux_num);
     printf("ランダムに数字が表示されるので\n次の数字が今の数字より大きい(High)か小さい(Low)かを予想してね。\n\n");
     printf("まずは最初の所持ポイントを決めます\n\n");
     system("pause");
@@ -56,6 +75,8 @@ int main(void){
                 use = 0;
             }
         } while((strcmp(input, High) != 0 && strcmp(input, Low) != 0) || use > point || use <= 0);
+        
+        sys = chance();
 
         point -= use;
 
@@ -70,18 +91,21 @@ int main(void){
             printf("同じ数なのでもう一度\n\n");
             point += use;
         } else if (strcmp(input, Low)==0 && cache1>new_num) {
-            sys = 0;
             cache1 = point;
             point += point_sys(use, sys);
             count++;
             printf("正解！！  %dP獲得！！\n\n", point-cache1);
         } else if (strcmp(input, High)==0 && cache1<new_num) {
-            sys = 0;
             cache1 = point;
             point += point_sys(use, sys);
             count++;
             printf("正解！！  %dP獲得！！\n\n", point-cache1);
         }else {
+            if(sys == 1) {
+                use += use * 5;
+                point -= use*4;
+            }
+            
             printf("残念  %dP失いました\n\n", use);
             count++;
         }
@@ -94,7 +118,7 @@ int main(void){
         }
     }
 
-/*    do {
+    do {
         printf("もういちどやる？ y/n：");
         scanf(" %c", &input1);
     } while(input1 != 'y' && input1 != 'n');
@@ -106,5 +130,4 @@ int main(void){
     }
     
 
-*/
 }
