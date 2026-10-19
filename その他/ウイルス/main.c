@@ -10,11 +10,11 @@ int num;
     Sleep(2000);
 
     printf("ƒGƒ‰[‚ª”­¶‚µ‚Ü‚µ‚½B\nC•œ‚ğ‚İ‚Ü‚·\n\n");
-    system("PAUSE");
-    system("color 0A");
+
 
     printf("There are any errors.\nSo, I will restart for me.\n\n");
-
+    system("PAUSE");
+    system("color 0A");
     for(num=0; num<20; num++) {
         printf("error error error\n");
         }
