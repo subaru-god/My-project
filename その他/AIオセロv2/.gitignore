@@ -1,0 +1,9 @@
+﻿# 重みファイル・モデル
+*.pth
+*.onnx
+
+# ライブラリ・DLLなど
+onnxruntime/
+*.dll
+*.lib
+*.pdb
